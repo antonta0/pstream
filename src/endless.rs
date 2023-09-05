@@ -303,9 +303,7 @@ impl<A: BlocksAllocator> Stream<A> {
     pub fn grow(&self) -> io::Result<()> {
         let mut stream = block::Stream::new(self.allocator.alloc()?);
         // No need to load - the new stream is assumed to be zero-initialized.
-        stream.initialize().map_err(|err| {
-            io::Error::new(io::ErrorKind::Other, StreamError::BlockStreamError(err))
-        })?;
+        stream.initialize().map_err(StreamError::BlockStreamError)?;
         assert!(stream.is_empty());
         self.streams.update_default(move |current, streams| {
             let _locked = Self::lock_buffers(current);
@@ -489,12 +487,10 @@ where
         })?;
         for stream in &mut streams {
             stream.load()?;
-            stream.initialize().map_err(|err| {
-                io::Error::new(io::ErrorKind::Other, StreamError::BlockStreamError(err))
-            })?;
+            stream.initialize().map_err(StreamError::BlockStreamError)?;
         }
         self.streams = BlockStreams::try_from(streams)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, StreamError::BrokenSpan))?
+            .map_err(|_| StreamError::BrokenSpan)?
             .into();
         // The offset is always at 0, because block streams were re-created.
         *self.offset.get_mut() = 0;
@@ -660,6 +656,13 @@ pub enum StreamError {
     Dirty,
     /// There are no block streams available for appends.
     Unavailable,
+}
+
+impl From<StreamError> for io::Error {
+    #[inline(always)]
+    fn from(value: StreamError) -> Self {
+        io::Error::new(io::ErrorKind::Other, value)
+    }
 }
 
 impl error::Error for StreamError {}
