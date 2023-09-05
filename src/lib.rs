@@ -27,6 +27,7 @@
 
 pub mod block;
 pub mod endless;
+pub mod io;
 
 #[doc(inline)]
 pub use block::Blocks;
