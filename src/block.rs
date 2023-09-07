@@ -34,9 +34,8 @@
 #![allow(clippy::cast_possible_truncation)]
 #![cfg(target_pointer_width = "64")]
 
-use core::{cell, cmp, fmt, hint, mem, ops, ptr, sync::atomic};
+use core::{cell, cmp, fmt, hint, ops, ptr, sync::atomic};
 
-use std::io::{Read, Seek, Write};
 use std::{error, io};
 
 /// Something that can be subdivided into blocks, each being a single unit of
@@ -49,6 +48,42 @@ pub trait Blocks {
     /// The size of a single block expressed as a power of two. This value must
     /// be fixed for the whole lifetime of [`Stream`].
     fn block_shift(&self) -> u32;
+
+    /// Loads the contents of blocks into `bufs` starting from `block`.
+    ///
+    /// This function must fill the `bufs` completely and otherwise return an
+    /// error. The contents of `bufs` are not specified and must not be checked
+    /// by the implementation.
+    ///
+    /// The current [`Stream`] implementation guarantees that the total length
+    /// of all `bufs` is divisible by block size.
+    ///
+    /// # Errors
+    ///
+    /// An error is returned if an IO error is encountered.
+    fn load_from(&mut self, block: u64, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<()>;
+
+    /// Stores the contents of `bufs` to blocks starting at `block`.
+    ///
+    /// This function must ensure that the `bufs` actually made it to the
+    /// underlying blocks. That is, every store call must sync data to disk.
+    ///
+    /// The current [`Stream`] implementation guarantees the following:
+    /// -   There is an even number of `bufs`.
+    /// -   Every pair within `bufs` adds up to block size, except for the last
+    ///     pair, where it can be smaller.
+    /// -   It is never called for the same block after that block has been
+    ///     written in full.
+    /// -   Incomplete blocks are always overwritten from the start until
+    ///     complete.
+    ///
+    /// If store fails for any reason, it could be retried with exactly the
+    /// same state.
+    ///
+    /// # Errors
+    ///
+    /// An error is returned if an IO error is encountered.
+    fn store_at(&mut self, block: u64, bufs: &mut [io::IoSlice<'_>]) -> io::Result<()>;
 }
 
 /// Size of the meta section of each block, with some room for future
@@ -112,13 +147,6 @@ macro_rules! data_section {
 /// after restarts, and efficiently navigate the stream. Data buffer is exposed
 /// as a byte slice to readers and is append-only. Metadata, however, may be
 /// rewritten on a block that has not been filled yet.
-///
-/// Vectored IO should be supported by `Blocks` for efficiency. This is a
-/// consequence of the memory layout. The current IO pattern for writes is a
-/// seek to the start of the current block, followed by a vectored IO with 2
-/// slices of meta and data sections per block. Each block is always written
-/// in full. Once the block is complete, it is normally never read or written,
-/// so there is no need to keep any caches around.
 ///
 /// The implementation is not optimized for more than one writer, although
 /// appends are quite efficient. The strategy for multiple writers could be
@@ -849,6 +877,98 @@ impl<B: Blocks> Stream<B> {
         }
         result
     }
+
+    /// Loads all data from the underlying blocks into memory. Blocks should
+    /// support vectored IO for efficiency.
+    ///
+    /// # Errors
+    ///
+    /// An error is returned if an IO error is encountered.
+    pub fn load(&mut self) -> io::Result<()> {
+        let block_count = self.block_count() as usize;
+        let mut iovec = Vec::with_capacity(2 * block_count);
+        for block in 0..block_count {
+            // SAFETY: Exclusive access to buffer is guaranteed by the borrow
+            // checker. iovec contains non-overlapping slices.
+            iovec.push(io::IoSliceMut::new(unsafe {
+                &mut (*self.meta_buffer.get())[meta_section!(block)]
+            }));
+            // SAFETY: See the comment above.
+            iovec.push(io::IoSliceMut::new(unsafe {
+                &mut (*self.data_buffer.get())[data_section!(self.block_shift(), block)]
+            }));
+        }
+        self.blocks.get_mut().load_from(0, &mut iovec)
+    }
+
+    /// Syncs dirty data in buffers into the underlying blocks. Blocks should
+    /// support vectored IO for efficiency.
+    ///
+    /// It is OK to retry in case an error is returned. Retry may attempt
+    /// syncing blocks that has been synced again. For example, block 1 and 2
+    /// have dirty data, block 1 has been written, writing block 2 failed.
+    /// A retry will write blocks 1 and 2 again.
+    ///
+    /// This call will spin wait if the lock is held by something else.
+    ///
+    /// # Errors
+    ///
+    /// An error is returned if an IO error is encountered.
+    pub fn sync(&self) -> io::Result<()> {
+        // Lock is required to prevent syncs of incomplete writes.
+        let lock = Lock::acquire(&self.locked);
+        self.sync_locked(&lock)
+    }
+
+    /// Pre-locked version of [`Stream::sync`].
+    ///
+    /// # Panics
+    ///
+    /// If the lock belongs to another block stream.
+    fn sync_locked(&self, lock: &Lock) -> io::Result<()> {
+        assert_eq!(
+            lock.0 as *const atomic::AtomicBool,
+            ptr::addr_of!(self.locked),
+            "unrelated lock",
+        );
+
+        // It is OK to load with relaxed, thanks to a lock.
+        let current = self.current.load(atomic::Ordering::Relaxed);
+        let synced = self.synced.load(atomic::Ordering::Relaxed);
+
+        if current == synced {
+            return Ok(());
+        }
+
+        let start = synced / self.data_section_size as usize;
+        let end = (current - 1) / self.data_section_size as usize;
+        let mut iovec = Vec::with_capacity((end - start + 1) * 2);
+        for block in start..=end {
+            // SAFETY: Concurrent mutable access is protected by the lock.
+            iovec.push(io::IoSlice::new(unsafe {
+                &(*self.meta_buffer.get())[meta_section!(block)]
+            }));
+            let data_range = if block == end {
+                data_offset!(self.block_shift(), block)..current
+            } else {
+                data_section!(self.block_shift(), block)
+            };
+            // SAFETY: Concurrent mutable access is protected by the lock.
+            iovec.push(io::IoSlice::new(unsafe {
+                &(*self.data_buffer.get())[data_range]
+            }));
+        }
+
+        // SAFETY: Concurrent mutable access is protected by the lock.
+        let blocks = unsafe { &mut *self.blocks.get() };
+        blocks.store_at(start as u64, &mut iovec)?;
+        // I thought of doing Release here, but it seems that Relaxed also
+        // works. Readers read from buffers, which has been written fully
+        // up to the state that is stored here because of the lock shared with
+        // append_with_opts
+        self.synced.store(current, atomic::Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 impl<B> Stream<B> {
@@ -981,129 +1101,6 @@ impl<B> Stream<B> {
         Lock::try_acquire(&self.locked)
             .map(|lock| LockedStream(self, lock))
             .ok_or(StreamError::Busy)
-    }
-}
-
-impl<B: Blocks + Read + Seek> Stream<B> {
-    /// Loads all data from the underlying blocks into memory. Blocks should
-    /// support vectored IO for efficiency.
-    ///
-    /// # Errors
-    ///
-    /// An error is returned if an IO error is encountered.
-    pub fn load(&mut self) -> io::Result<()> {
-        self.blocks.get_mut().rewind()?;
-
-        let block_count = self.block_count() as usize;
-        let mut iovec = Vec::with_capacity(2 * block_count);
-        for block in 0..block_count {
-            // SAFETY: Exclusive access to buffer is guaranteed by the borrow
-            // checker. iovec contains non-overlapping slices.
-            iovec.push(io::IoSliceMut::new(unsafe {
-                &mut (*self.meta_buffer.get())[meta_section!(block)]
-            }));
-            // SAFETY: See the comment above.
-            iovec.push(io::IoSliceMut::new(unsafe {
-                &mut (*self.data_buffer.get())[data_section!(self.block_shift(), block)]
-            }));
-        }
-
-        let mut remaining = block_count << self.block_shift();
-        while remaining != 0 {
-            let read = self.blocks.get_mut().read_vectored(&mut iovec)?;
-            // FUTURE: Use io_slice_advance feature when stable.
-            advance_iovec(&mut iovec, read, |bytes| {
-                // SAFETY: The iovec was already mutable, advancing it does
-                // not violate the non-overlapping property.
-                io::IoSliceMut::new(unsafe {
-                    // Get a mutable borrow to bytes by creating a new slice.
-                    core::slice::from_raw_parts_mut(bytes.as_ptr() as *mut u8, bytes.len())
-                })
-            });
-            remaining -= read;
-        }
-        Ok(())
-    }
-}
-
-impl<B: Blocks + Write + Seek> Stream<B> {
-    /// Syncs dirty data in buffers into the underlying blocks. Blocks should
-    /// support vectored IO for efficiency.
-    ///
-    /// It is OK to retry in case an error is returned. Retry may attempt
-    /// syncing blocks that has been synced again. For example, block 1 and 2
-    /// have dirty data, block 1 has been written, writing block 2 failed.
-    /// A retry will write blocks 1 and 2 again.
-    ///
-    /// This call will spin wait if the lock is held by something else.
-    ///
-    /// # Errors
-    ///
-    /// An error is returned if an IO error is encountered.
-    pub fn sync(&self) -> io::Result<()> {
-        // Lock is required to prevent syncs of incomplete writes.
-        let lock = Lock::acquire(&self.locked);
-        self.sync_locked(&lock)
-    }
-
-    /// Pre-locked version of [`Stream::sync`].
-    ///
-    /// # Panics
-    ///
-    /// If the lock belongs to another block stream.
-    fn sync_locked(&self, lock: &Lock) -> io::Result<()> {
-        assert_eq!(
-            lock.0 as *const atomic::AtomicBool,
-            ptr::addr_of!(self.locked),
-            "unrelated lock",
-        );
-
-        // It is OK to load with relaxed, thanks to a lock.
-        let current = self.current.load(atomic::Ordering::Relaxed);
-        let synced = self.synced.load(atomic::Ordering::Relaxed);
-
-        if current == synced {
-            return Ok(());
-        }
-
-        let start = synced / self.data_section_size as usize;
-        let end = (current - 1) / self.data_section_size as usize;
-        let mut iovec = Vec::with_capacity((end - start + 1) * 2);
-        for block in start..=end {
-            // SAFETY: Concurrent mutable access is protected by the lock.
-            iovec.push(io::IoSlice::new(unsafe {
-                &(*self.meta_buffer.get())[meta_section!(block)]
-            }));
-            // SAFETY: Concurrent mutable access is protected by the lock.
-            iovec.push(io::IoSlice::new(unsafe {
-                &(*self.data_buffer.get())[data_section!(self.block_shift(), block)]
-            }));
-        }
-
-        // SAFETY: Concurrent mutable access is protected by the lock.
-        let blocks = unsafe { &mut *self.blocks.get() };
-        blocks.seek(io::SeekFrom::Start((start as u64) << self.block_shift()))?;
-        let mut remaining = (end - start + 1) << self.block_shift();
-        // FUTURE: Use write_all_vectored feature when stable.
-        while remaining != 0 {
-            let written = match blocks.write_vectored(&iovec) {
-                Ok(0) => Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to sync stream",
-                )),
-                other => other,
-            }?;
-            advance_iovec(&mut iovec, written, io::IoSlice::new);
-            remaining -= written;
-        }
-
-        blocks.flush()?;
-        // I thought of doing Release here, but it seems that Relaxed also
-        // works. Readers read from buffers, which has been written fully
-        // up to the state that is stored here because of the lock shared with
-        // append_with_opts
-        self.synced.store(current, atomic::Ordering::Relaxed);
-        Ok(())
     }
 }
 
@@ -1435,46 +1432,6 @@ impl<B: Blocks> Stream<B> {
     }
 }
 
-/// A workaround to advance slice of `IoSlice` or `IoSliceMut` types in a way
-/// that does not depend on implementation details. The values are replaced
-/// with a result of `F`, which receives a slice of the underlying buffer of
-/// the previous `IoSlice`.
-///
-/// # Panics
-///
-/// Panics if `n` is greater than the sum of lengths of `iovec`.
-fn advance_iovec<'a, T: ops::Deref<Target = [u8]>, F>(iovec: &mut [T], n: usize, new: F)
-where
-    F: Fn(&'a [u8]) -> T,
-{
-    let mut next = 0;
-    let mut remaining = n;
-    for bytes in iovec.iter() {
-        if n.saturating_sub(bytes.len()) == 0 {
-            break;
-        }
-        next += 1;
-        remaining -= bytes.len();
-    }
-    assert_ne!(next, iovec.len(), "advancing iovec beyond length");
-
-    for vec in iovec.iter_mut().take(next) {
-        if vec.len() != 0 {
-            *vec = new(&[]);
-        }
-    }
-    // SAFETY: Slice re-created is the same slice, yet with a different lifetime
-    // to trick the borrow checker. Based on the context where it is used,
-    // the memory where inner slices are pointing to outlive the iovec.
-    let bytes = new(unsafe {
-        core::slice::from_raw_parts(
-            iovec[next][remaining..].as_ptr(),
-            iovec[next].len() - remaining,
-        )
-    });
-    let _ = mem::replace(&mut iovec[next], bytes);
-}
-
 /// A locked [`Stream`]. Returned by [`Stream::try_lock`] or [`Stream::lock`].
 #[derive(Debug)]
 #[must_use = "locking without holding a lock does not make sense?"]
@@ -1520,9 +1477,7 @@ impl<B: Blocks> LockedStream<'_, B> {
     pub fn verify<F: FnMut(Inconsistency)>(this: &Self, error: F) -> bool {
         this.0.verify_locked(error, &this.1)
     }
-}
 
-impl<B: Blocks + Write + Seek> LockedStream<'_, B> {
     /// Same as [`Stream::sync`], except that it is pre-locked.
     ///
     /// # Errors
@@ -1761,6 +1716,7 @@ impl Default for AboutBlock {
 #[cfg(test)]
 mod tests {
     use core::array;
+    use std::io::{Read, Seek, Write};
 
     use super::*;
 
@@ -1852,6 +1808,16 @@ mod tests {
             fn block_shift(&self) -> u32 {
                 10
             }
+            fn load_from(
+                &mut self,
+                _block: u64,
+                _bufs: &mut [io::IoSliceMut<'_>],
+            ) -> io::Result<()> {
+                unimplemented!()
+            }
+            fn store_at(&mut self, _block: u64, _bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+                unimplemented!()
+            }
         }
         let _ = Stream::new(EmptyBlocks);
     }
@@ -1866,6 +1832,16 @@ mod tests {
             }
             fn block_shift(&self) -> u32 {
                 28
+            }
+            fn load_from(
+                &mut self,
+                _block: u64,
+                _bufs: &mut [io::IoSliceMut<'_>],
+            ) -> io::Result<()> {
+                unimplemented!()
+            }
+            fn store_at(&mut self, _block: u64, _bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+                unimplemented!()
             }
         }
         let _ = Stream::new(LargeBlocks);
@@ -3068,41 +3044,6 @@ mod tests {
         about.set_trail_bytes(1 << 28);
     }
 
-    #[test]
-    fn advance_iovec_fn() {
-        let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
-        let mut iovec = [
-            io::IoSlice::new(&data[0..2]),
-            io::IoSlice::new(&data[2..4]),
-            io::IoSlice::new(&data[4..8]),
-        ];
-        let concat = |iovec: &[io::IoSlice]| {
-            iovec
-                .iter()
-                .map(|bytes| bytes.as_ref())
-                .collect::<Vec<_>>()
-                .concat()
-        };
-
-        advance_iovec(&mut iovec, 0, |bytes| io::IoSlice::new(&bytes));
-        assert_eq!(concat(&iovec), &data[0..8]);
-        advance_iovec(&mut iovec, 1, |bytes| io::IoSlice::new(&bytes));
-        assert_eq!(concat(&iovec), &data[1..8]);
-        advance_iovec(&mut iovec, 1, |bytes| io::IoSlice::new(&bytes));
-        assert_eq!(concat(&iovec), &data[2..8]);
-        advance_iovec(&mut iovec, 3, |bytes| io::IoSlice::new(&bytes));
-        assert_eq!(concat(&iovec), &data[5..8]);
-        advance_iovec(&mut iovec, 3, |bytes| io::IoSlice::new(&bytes));
-        assert_eq!(concat(&iovec), &[]);
-    }
-
-    #[test]
-    #[should_panic(expected = "advancing iovec beyond length")]
-    fn advance_iovec_fn_beyond_length() {
-        let mut iovec = [io::IoSlice::new(&[0x01, 0x02]), io::IoSlice::new(&[0x03])];
-        advance_iovec(&mut iovec, 4, |bytes| io::IoSlice::new(&bytes));
-    }
-
     static TEST_WORDS_REPEATING: [u64; 170] = [0xcccccccc_u64.to_le(); 170];
     static TEST_BYTES_REPEATING: &'static [u8] = test_words_as_bytes(&TEST_WORDS_REPEATING);
 
@@ -3205,30 +3146,24 @@ mod tests {
         fn block_shift(&self) -> u32 {
             Self::BLOCK_BITS
         }
-    }
 
-    impl Read for TestMemoryBlocks {
         #[inline(always)]
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf)
-        }
-    }
-
-    impl Seek for TestMemoryBlocks {
-        #[inline(always)]
-        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
-            self.0.seek(pos)
-        }
-    }
-
-    impl Write for TestMemoryBlocks {
-        #[inline(always)]
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.write(buf)
+        fn load_from(&mut self, block: u64, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<()> {
+            self.0
+                .seek(io::SeekFrom::Start(block << Self::BLOCK_BITS))?;
+            for buf in bufs {
+                self.0.read_exact(buf)?;
+            }
+            Ok(())
         }
 
         #[inline(always)]
-        fn flush(&mut self) -> io::Result<()> {
+        fn store_at(&mut self, block: u64, bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+            self.0
+                .seek(io::SeekFrom::Start(block << Self::BLOCK_BITS))?;
+            for buf in bufs {
+                self.0.write_all(buf)?;
+            }
             Ok(())
         }
     }

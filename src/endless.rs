@@ -153,6 +153,48 @@ impl<A: BlocksAllocator> Stream<A> {
         }
     }
 
+    /// Clears underlying memory and loads this stream from the allocator
+    /// state. The previously used blocks are discarded and not released.
+    /// On success, returns stats about this stream, should it be needed for
+    /// allocating more blocks.
+    ///
+    /// The offset is reset to the start. To set the offset again, refer to
+    /// [`Stream::set_offset`] or [`Stream::advance`].
+    ///
+    /// This function does not allocate blocks by itself. Instead, use
+    /// [`Stream::grow`] to grow the stream.
+    ///
+    /// # Errors
+    ///
+    /// An error is returned if an IO error is encountered. If the error is
+    /// caused by this implementation, rather than the underlying `Blocks`,
+    /// the error will be of [`io::ErrorKind::Other`] kind and the value set
+    /// to one of:
+    ///
+    /// -   [`StreamError::BlockStreamError`] as returned during
+    ///     [`block::Stream::initialize`].
+    /// -   [`StreamError::BrokenSpan`] if block stream trailing and spilled
+    ///     sections do not match.
+    pub fn load(&mut self) -> io::Result<Stats> {
+        // Drop old data completely to free up memory.
+        self.streams = BlockStreams::new().into();
+
+        let mut streams = collections::VecDeque::new();
+        self.allocator.retrieve(|blocks| {
+            streams.push_back(block::Stream::new(blocks));
+        })?;
+        for stream in &mut streams {
+            stream.load()?;
+            stream.initialize().map_err(StreamError::BlockStreamError)?;
+        }
+        self.streams = BlockStreams::try_from(streams)
+            .map_err(|_| StreamError::BrokenSpan)?
+            .into();
+        // The offset is always at 0, because block streams were re-created.
+        *self.offset.get_mut() = 0;
+        Ok(self.streams.get_mut().stats(0))
+    }
+
     /// Sets the offset by searching through the block streams data. The offset
     /// is set only when the exact match is found, otherwise `false` is
     /// returned. If there are multiple matches, the match within the left-most
@@ -276,6 +318,145 @@ impl<A: BlocksAllocator> Stream<A> {
         // counter, it is always consistent with the streams and is always
         // incrementing.
         self.offset.fetch_max(ctx.0, atomic::Ordering::Relaxed) < ctx.0
+    }
+
+    /// Appends `bytes` to this stream according to [`SpanBehavior`].
+    ///
+    /// The maximum allowed size of an append can be no larger than the
+    /// capacity of a single [`block::Stream`] at which the write is happening.
+    /// Furthermore, there is a hard limit imposed by the current block stream
+    /// implementation - see [`block::Stream::append_with_opts`].
+    ///
+    /// This call expects block streams to be in a fully synced state and
+    /// returns a context necessary to sync the memory, which if dropped,
+    /// forces the sync. It also locks the block stream at which append is
+    /// going to happen, preventing concurrent appends.
+    ///
+    /// Unless the data is synced via [`AppendContext::sync`] or by dropping
+    /// the returned value, the underlying blocks are not modified and the
+    /// following appends will fail due to the stream(s) being in a dirty state.
+    ///
+    /// Since it is guaranteed that no more appends will happen until the sync
+    /// is complete, and dirty reads are not accessible to readers, the caller
+    /// could choose to run some extra code during appends with atomic properties.
+    ///
+    /// # Errors
+    ///
+    /// If size of `bytes` exceeds the allowed size of a single block stream,
+    /// [`StreamError::AppendTooLarge`] is returned, or if the limit is hit on
+    /// a block stream side, [`block::StreamError::AppendTooLarge`]. See above
+    /// description for details.
+    ///
+    /// A concurrent append will result in a [`block::StreamError::Busy`] or
+    /// [`StreamError::Dirty`] error, depending on the state.
+    ///
+    /// If block streams are not available to handle the append,
+    /// [`StreamError::Unavailable`] error is returned. This can be fixed by
+    /// calling [`Stream::grow`], which can add empty block stream(s) to the
+    /// end.
+    ///
+    /// Neither memory, nor the storage is modified if an errors is returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the current stream used for appends is followed by a stream
+    /// which is not an empty. It will also panic if the number of bytes written
+    /// to a block stream does not match the input, which should never happen.
+    pub fn append(&self, bytes: &[u8]) -> Result<AppendContext<'_, A::Blocks>, StreamError> {
+        block::Stream::<A::Blocks>::verify_append(bytes).map_err(StreamError::BlockStreamError)?;
+
+        let streams = self.streams.read();
+        let index = streams.pick_ending().ok_or(StreamError::Unavailable)?;
+
+        // Appending empty bytes always succeeds.
+        if bytes.is_empty() {
+            return Ok(AppendContext::new(&self.streams));
+        }
+        // This is an extra check due to the order of syncs during spanned
+        // appends - first the right stream is synced, then the left one. If
+        // the right sync succeeds, yet the left one fails, the following
+        // appends would just continue appending to the right stream and
+        // further. To prevent that, make sure that the left stream has been
+        // synced too by checking whether it is dirty.
+        // It is OK to check it here before locking the streams, as it is
+        // not going to be used for appends anymore.
+        if streams
+            .get(index.saturating_sub(1))
+            .is_some_and(block::Stream::is_dirty)
+        {
+            return Err(StreamError::Dirty);
+        }
+
+        macro_rules! acquire_stream {
+            ($index:expr) => {{
+                let stream = streams.get($index).ok_or(StreamError::Unavailable)?;
+                stream.try_lock().map_err(StreamError::BlockStreamError)?
+            }};
+        }
+
+        let stream = acquire_stream!(index);
+        if stream.is_dirty() {
+            return Err(StreamError::Dirty);
+        }
+        let remaining = stream.capacity() - stream.len();
+        if bytes.len() <= remaining {
+            let written = block::LockedStream::append(&stream, bytes)
+                .expect("input is checked prior to writing");
+            assert_eq!(written, bytes.len());
+            return Ok(AppendContext::new(&self.streams).with_left(index));
+        }
+        if stream.is_empty() {
+            return Err(StreamError::AppendTooLarge(stream.capacity()));
+        }
+
+        // If bytes do not fit into a single stream, choose based on the
+        // configured behavior, but first lock the next stream in sequence,
+        // which is supposed to be empty.
+        let empty = acquire_stream!(index + 1);
+        assert!(empty.is_empty());
+        // We are going to write all bytes to the next stream at most, so
+        // check that they can actually fit into that stream.
+        if bytes.len() > empty.capacity() {
+            return Err(StreamError::AppendTooLarge(empty.capacity()));
+        }
+
+        match self.span_behavior {
+            SpanBehavior::Never => {
+                let written = block::LockedStream::append(&empty, bytes)
+                    .expect("input is checked prior to writing");
+                assert_eq!(written, bytes.len());
+                Ok(AppendContext::new(&self.streams).with_right(index + 1))
+            }
+            SpanBehavior::Sized(limit) if bytes.len() >= limit => {
+                let written = block::LockedStream::append(&empty, bytes)
+                    .expect("input is checked prior to writing");
+                assert_eq!(written, bytes.len());
+                Ok(AppendContext::new(&self.streams).with_right(index + 1))
+            }
+            SpanBehavior::Sized(_) => {
+                // Writing whole bytes here, so it is correctly marked as trail
+                // on a block stream side.
+                let written = block::LockedStream::append(&stream, bytes)
+                    .expect("input is checked prior to writing");
+                assert_eq!(written, remaining);
+                let trailing = &bytes[..remaining];
+                let spilled = &bytes[remaining..];
+                let written =
+                    block::LockedStream::append_with_opts(&empty, spilled, /*spilled=*/ true)
+                        .expect("input is checked prior to writing");
+                assert_eq!(written, spilled.len());
+                // SAFETY: Concurrent clones of streams are protected by a
+                // lock on the `empty` block stream, hence preventing a clone
+                // of buffers which are being updated. See `lock_buffers`.
+                assert!(
+                    unsafe { streams.set_buffer(index, trailing, spilled) },
+                    "new buffer write"
+                );
+                Ok(AppendContext::new(&self.streams)
+                    .with_left(index)
+                    .with_right(index + 1))
+            }
+        }
     }
 
     /// Grows this stream by one allocation of `A::Blocks` via the underlying
@@ -451,197 +632,6 @@ impl<A: BlocksAllocator> Stream<A> {
     }
 }
 
-impl<A: BlocksAllocator> Stream<A>
-where
-    A::Blocks: io::Read + io::Seek,
-{
-    /// Clears underlying memory and loads this stream from the allocator
-    /// state. The previously used blocks are discarded and not released.
-    /// On success, returns stats about this stream, should it be needed for
-    /// allocating more blocks.
-    ///
-    /// The offset is reset to the start. To set the offset again, refer to
-    /// [`Stream::set_offset`] or [`Stream::advance`].
-    ///
-    /// This function does not allocate blocks by itself. Instead, use
-    /// [`Stream::grow`] to grow the stream.
-    ///
-    /// # Errors
-    ///
-    /// An error is returned if an IO error is encountered. If the error is
-    /// caused by this implementation, rather than the underlying `Blocks`,
-    /// the error will be of [`io::ErrorKind::Other`] kind and the value set
-    /// to one of:
-    ///
-    /// -   [`StreamError::BlockStreamError`] as returned during
-    ///     [`block::Stream::initialize`].
-    /// -   [`StreamError::BrokenSpan`] if block stream trailing and spilled
-    ///     sections do not match.
-    pub fn load(&mut self) -> io::Result<Stats> {
-        // Drop old data completely to free up memory.
-        self.streams = BlockStreams::new().into();
-
-        let mut streams = collections::VecDeque::new();
-        self.allocator.retrieve(|blocks| {
-            streams.push_back(block::Stream::new(blocks));
-        })?;
-        for stream in &mut streams {
-            stream.load()?;
-            stream.initialize().map_err(StreamError::BlockStreamError)?;
-        }
-        self.streams = BlockStreams::try_from(streams)
-            .map_err(|_| StreamError::BrokenSpan)?
-            .into();
-        // The offset is always at 0, because block streams were re-created.
-        *self.offset.get_mut() = 0;
-        Ok(self.streams.get_mut().stats(0))
-    }
-}
-
-impl<A: BlocksAllocator> Stream<A>
-where
-    A::Blocks: io::Write + io::Seek,
-{
-    /// Appends `bytes` to this stream according to [`SpanBehavior`].
-    ///
-    /// The maximum allowed size of an append can be no larger than the
-    /// capacity of a single [`block::Stream`] at which the write is happening.
-    /// Furthermore, there is a hard limit imposed by the current block stream
-    /// implementation - see [`block::Stream::append_with_opts`].
-    ///
-    /// This call expects block streams to be in a fully synced state and
-    /// returns a context necessary to sync the memory, which if dropped,
-    /// forces the sync. It also locks the block stream at which append is
-    /// going to happen, preventing concurrent appends.
-    ///
-    /// Unless the data is synced via [`AppendContext::sync`] or by dropping
-    /// the returned value, the underlying blocks are not modified and the
-    /// following appends will fail due to the stream(s) being in a dirty state.
-    ///
-    /// Since it is guaranteed that no more appends will happen until the sync
-    /// is complete, and dirty reads are not accessible to readers, the caller
-    /// could choose to run some extra code during appends with atomic properties.
-    ///
-    /// # Errors
-    ///
-    /// If size of `bytes` exceeds the allowed size of a single block stream,
-    /// [`StreamError::AppendTooLarge`] is returned, or if the limit is hit on
-    /// a block stream side, [`block::StreamError::AppendTooLarge`]. See above
-    /// description for details.
-    ///
-    /// A concurrent append will result in a [`block::StreamError::Busy`] or
-    /// [`StreamError::Dirty`] error, depending on the state.
-    ///
-    /// If block streams are not available to handle the append,
-    /// [`StreamError::Unavailable`] error is returned. This can be fixed by
-    /// calling [`Stream::grow`], which can add empty block stream(s) to the
-    /// end.
-    ///
-    /// Neither memory, nor the storage is modified if an errors is returned.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the current stream used for appends is followed by a stream
-    /// which is not an empty. It will also panic if the number of bytes written
-    /// to a block stream does not match the input, which should never happen.
-    pub fn append(&self, bytes: &[u8]) -> Result<AppendContext<'_, A::Blocks>, StreamError> {
-        block::Stream::<A::Blocks>::verify_append(bytes).map_err(StreamError::BlockStreamError)?;
-
-        let streams = self.streams.read();
-        let index = streams.pick_ending().ok_or(StreamError::Unavailable)?;
-
-        // Appending empty bytes always succeeds.
-        if bytes.is_empty() {
-            return Ok(AppendContext::new(&self.streams));
-        }
-        // This is an extra check due to the order of syncs during spanned
-        // appends - first the right stream is synced, then the left one. If
-        // the right sync succeeds, yet the left one fails, the following
-        // appends would just continue appending to the right stream and
-        // further. To prevent that, make sure that the left stream has been
-        // synced too by checking whether it is dirty.
-        // It is OK to check it here before locking the streams, as it is
-        // not going to be used for appends anymore.
-        if streams
-            .get(index.saturating_sub(1))
-            .is_some_and(block::Stream::is_dirty)
-        {
-            return Err(StreamError::Dirty);
-        }
-
-        macro_rules! acquire_stream {
-            ($index:expr) => {{
-                let stream = streams.get($index).ok_or(StreamError::Unavailable)?;
-                stream.try_lock().map_err(StreamError::BlockStreamError)?
-            }};
-        }
-
-        let stream = acquire_stream!(index);
-        if stream.is_dirty() {
-            return Err(StreamError::Dirty);
-        }
-        let remaining = stream.capacity() - stream.len();
-        if bytes.len() <= remaining {
-            let written = block::LockedStream::append(&stream, bytes)
-                .expect("input is checked prior to writing");
-            assert_eq!(written, bytes.len());
-            return Ok(AppendContext::new(&self.streams).with_left(index));
-        }
-        if stream.is_empty() {
-            return Err(StreamError::AppendTooLarge(stream.capacity()));
-        }
-
-        // If bytes do not fit into a single stream, choose based on the
-        // configured behavior, but first lock the next stream in sequence,
-        // which is supposed to be empty.
-        let empty = acquire_stream!(index + 1);
-        assert!(empty.is_empty());
-        // We are going to write all bytes to the next stream at most, so
-        // check that they can actually fit into that stream.
-        if bytes.len() > empty.capacity() {
-            return Err(StreamError::AppendTooLarge(empty.capacity()));
-        }
-
-        match self.span_behavior {
-            SpanBehavior::Never => {
-                let written = block::LockedStream::append(&empty, bytes)
-                    .expect("input is checked prior to writing");
-                assert_eq!(written, bytes.len());
-                Ok(AppendContext::new(&self.streams).with_right(index + 1))
-            }
-            SpanBehavior::Sized(limit) if bytes.len() >= limit => {
-                let written = block::LockedStream::append(&empty, bytes)
-                    .expect("input is checked prior to writing");
-                assert_eq!(written, bytes.len());
-                Ok(AppendContext::new(&self.streams).with_right(index + 1))
-            }
-            SpanBehavior::Sized(_) => {
-                // Writing whole bytes here, so it is correctly marked as trail
-                // on a block stream side.
-                let written = block::LockedStream::append(&stream, bytes)
-                    .expect("input is checked prior to writing");
-                assert_eq!(written, remaining);
-                let trailing = &bytes[..remaining];
-                let spilled = &bytes[remaining..];
-                let written =
-                    block::LockedStream::append_with_opts(&empty, spilled, /*spilled=*/ true)
-                        .expect("input is checked prior to writing");
-                assert_eq!(written, spilled.len());
-                // SAFETY: Concurrent clones of streams are protected by a
-                // lock on the `empty` block stream, hence preventing a clone
-                // of buffers which are being updated. See `lock_buffers`.
-                assert!(
-                    unsafe { streams.set_buffer(index, trailing, spilled) },
-                    "new buffer write"
-                );
-                Ok(AppendContext::new(&self.streams)
-                    .with_left(index)
-                    .with_right(index + 1))
-            }
-        }
-    }
-}
-
 /// Errors specific to the [`Stream`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StreamError {
@@ -741,13 +731,13 @@ pub enum SearchControl {
 /// The context that captures the state necessary to sync an append after
 /// [`Stream::append`]. If dropped, it will attempt to sync once.
 #[derive(Debug)]
-pub struct AppendContext<'a, B: Blocks + io::Write + io::Seek> {
+pub struct AppendContext<'a, B: Blocks> {
     streams: &'a vlock::VLock<BlockStreams<B>, 2>,
     left: Option<usize>,
     right: Option<usize>,
 }
 
-impl<'a, B: Blocks + io::Write + io::Seek> AppendContext<'a, B> {
+impl<'a, B: Blocks> AppendContext<'a, B> {
     /// Creates a new empty context, which is synced.
     #[inline(always)]
     #[must_use]
@@ -758,9 +748,7 @@ impl<'a, B: Blocks + io::Write + io::Seek> AppendContext<'a, B> {
             right: None,
         }
     }
-}
 
-impl<B: Blocks + io::Write + io::Seek> AppendContext<'_, B> {
     /// Sets the left index, i.e. the index that is synced after right.
     #[inline(always)]
     #[must_use]
@@ -823,7 +811,7 @@ impl<B: Blocks + io::Write + io::Seek> AppendContext<'_, B> {
     }
 }
 
-impl<B: Blocks + io::Write + io::Seek> ops::Drop for AppendContext<'_, B> {
+impl<B: Blocks> ops::Drop for AppendContext<'_, B> {
     /// Attempts to [`AppendContext::sync`] and panics if it returns an error.
     #[inline(always)]
     fn drop(&mut self) {
@@ -1782,6 +1770,7 @@ fn make_span_buffer(trail: &[u8], spill: &[u8]) -> Result<Option<Vec<u8>>, ()> {
 #[cfg(test)]
 mod tests {
     use core::{mem, time};
+    use std::io::{Read, Seek, Write};
     use std::thread;
 
     use super::*;
@@ -3212,30 +3201,24 @@ mod tests {
         fn block_shift(&self) -> u32 {
             Self::BLOCK_SHIFT
         }
-    }
 
-    impl io::Read for TestMemoryBlocks {
         #[inline(always)]
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf)
-        }
-    }
-
-    impl io::Seek for TestMemoryBlocks {
-        #[inline(always)]
-        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
-            self.0.seek(pos)
-        }
-    }
-
-    impl io::Write for TestMemoryBlocks {
-        #[inline(always)]
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.write(buf)
+        fn load_from(&mut self, block: u64, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<()> {
+            self.0
+                .seek(io::SeekFrom::Start(block << Self::BLOCK_SHIFT))?;
+            for buf in bufs {
+                self.0.read_exact(buf)?;
+            }
+            Ok(())
         }
 
         #[inline(always)]
-        fn flush(&mut self) -> io::Result<()> {
+        fn store_at(&mut self, block: u64, bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+            self.0
+                .seek(io::SeekFrom::Start(block << Self::BLOCK_SHIFT))?;
+            for buf in bufs {
+                self.0.write_all(buf)?;
+            }
             Ok(())
         }
     }

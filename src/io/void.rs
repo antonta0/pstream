@@ -41,6 +41,16 @@ impl Blocks for Void {
     fn block_shift(&self) -> u32 {
         self.block_shift
     }
+
+    #[inline(always)]
+    fn load_from(&mut self, _block: u64, _bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn store_at(&mut self, _block: u64, _bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 unsafe impl BlocksAllocator for Void {
@@ -59,35 +69,6 @@ unsafe impl BlocksAllocator for Void {
 
     #[inline(always)]
     fn retrieve(&self, _f: impl FnMut(Void)) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl io::Read for Void {
-    #[inline(always)]
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        Ok(buf.len())
-    }
-}
-
-impl io::Seek for Void {
-    #[inline(always)]
-    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
-        if let io::SeekFrom::Start(pos) = pos {
-            return Ok(pos);
-        }
-        unimplemented!("block stream only seeks from the start")
-    }
-}
-
-impl io::Write for Void {
-    #[inline(always)]
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Ok(buf.len())
-    }
-
-    #[inline(always)]
-    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
