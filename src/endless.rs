@@ -3246,7 +3246,7 @@ mod tests {
             if let TestMaybeDrop::Manual(ref mut cursor) = self.0 {
                 // Drop the cursor, but not the underlying vector.
                 let cursor = unsafe { mem::ManuallyDrop::take(cursor) };
-                drop(mem::ManuallyDrop::new(cursor.into_inner()));
+                mem::forget(cursor.into_inner());
             }
         }
     }
