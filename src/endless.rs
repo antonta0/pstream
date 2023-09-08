@@ -793,6 +793,9 @@ impl<'a, B: Blocks> AppendContext<'a, B> {
     /// [`block::Stream::sync`] on one of the underlying blocks.
     #[inline]
     pub fn sync(&mut self) -> io::Result<()> {
+        if self.is_synced() {
+            return Ok(());
+        }
         // NOTE: If the right sync completes, yet the left one fails, the reads
         // at runtime are guarded by a condition based on the left sync. With
         // the left sync incomplete, restart will see the data as corrupted -
@@ -812,12 +815,10 @@ impl<'a, B: Blocks> AppendContext<'a, B> {
 }
 
 impl<B: Blocks> ops::Drop for AppendContext<'_, B> {
-    /// Attempts to [`AppendContext::sync`] and panics if it returns an error.
+    /// Attempts to sync via [`AppendContext::sync`] once. Errors are ignored.
     #[inline(always)]
     fn drop(&mut self) {
-        if !self.is_synced() {
-            self.sync().expect("sync during drop");
-        }
+        let _ = self.sync();
     }
 }
 
