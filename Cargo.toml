@@ -6,3 +6,18 @@ edition = "2021"
 [dependencies]
 crc32fast = "~1.3"
 vlock = "~0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "~0.2", optional = true }
+
+[features]
+default = []
+io-filesystem = []
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[test]]
+name = "io_filesystem"
+path = "tests/io_filesystem.rs"
+required-features = ["io-filesystem"]

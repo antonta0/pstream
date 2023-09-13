@@ -20,6 +20,19 @@
 //! byte stream backed by blocks, which is then used further to build a
 //! conceptually endless stream of data. Refer to relevant module documentation
 //! for details.
+//!
+//! # Features
+//!
+//! This library aims to be minimal, hence extra functionality which is not
+//! part of the core implementation sits behind [Cargo features][features] for
+//! conditional compilation. The following features are available:
+//! -   `io-filesystem` - includes storage implementation for block streams
+//!     backed by a generic filesystem.
+//! -   `libc` - if enabled, file-backed IO will use more efficient and reliable
+//!     calls to the Linux kernel. Makes sense only for Linux.
+//!
+//! [features]: https://doc.rust-lang.org/cargo/reference/features.html
+//! ```
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
