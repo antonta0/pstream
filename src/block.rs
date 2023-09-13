@@ -1570,7 +1570,7 @@ impl ops::Drop for Lock<'_> {
 ///   partial write to this block, i.e. the trailing size. If block is not
 ///   complete, this is the offset from the start of the data section of the
 ///   block to the end of the last write to that block. Hence, the block size
-///   is limited roughly to 128 MiB.
+///   is limited roughly to 256 MiB.
 /// C (2 bits) = Unused.
 /// D (30 bits) = The remaining size in bytes of the data spilling from the
 ///   previous block(s). From that it is possible to derive how many blocks
@@ -1624,7 +1624,7 @@ impl AboutBlock {
     }
 
     /// Returns the amount of data in the trail part of this block in bytes.
-    /// Maximum is capped at 2^28 - 1 bytes.
+    /// Maximum is capped at 2<sup>28</sup> &minus; 1 bytes.
     #[inline(always)]
     #[must_use]
     fn trail_bytes(self) -> u64 {
@@ -1635,7 +1635,7 @@ impl AboutBlock {
     ///
     /// # Panics
     ///
-    /// Panics if the value is greater than 2^28 -1.
+    /// Panics if the value is greater than 2<sup>28</sup> &minus; 1.
     #[inline(always)]
     fn set_trail_bytes(&mut self, bytes: u64) {
         assert!(bytes < 1 << Self::TRAIL_BITS, "too much bytes");
@@ -1644,7 +1644,8 @@ impl AboutBlock {
     }
 
     /// Returns the amount of data spilled from the previous block to this and
-    /// potentially future block(s) in bytes. Maximum is capped at 2^30 - 1 bytes.
+    /// potentially future block(s) in bytes. Maximum is capped at
+    /// 2<sup>30</sup> &minus; 1 bytes.
     #[inline(always)]
     #[must_use]
     fn spilled_bytes(self) -> u64 {
@@ -1655,7 +1656,7 @@ impl AboutBlock {
     ///
     /// # Panics
     ///
-    /// Panics if the value is greater than 2^30 -1.
+    /// Panics if the value is greater than 2<sup>30</sup> &minus; 1.
     #[inline(always)]
     fn set_spilled_bytes(&mut self, bytes: u64) {
         assert!(bytes < 1 << Self::SPILLED_BITS, "too much bytes");
