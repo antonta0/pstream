@@ -32,6 +32,25 @@
 //!     calls to the Linux kernel. Makes sense only for Linux.
 //!
 //! [features]: https://doc.rust-lang.org/cargo/reference/features.html
+//!
+//! # Examples
+//!
+//! ```
+//! use std::io;
+//!
+//! use pstream::{EndlessStream, io::Void};
+//!
+//! fn main() -> io::Result<()> {
+//!     let void = Void::new(10, 17);
+//!     let stream = EndlessStream::new(void);
+//!     stream.grow()?;
+//!     let data = [10u8; 8].as_slice();
+//!     stream.append(data)?;
+//!     for chunk in stream.iter() {
+//!         assert_eq!(chunk.bytes().unwrap().as_ref(), data);
+//!     }
+//!     Ok(())
+//! }
 //! ```
 
 #![warn(missing_docs)]
