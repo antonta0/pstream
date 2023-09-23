@@ -32,11 +32,13 @@
 // by a cfg below. Exception is `AboutBlock`, where the casts are meant to
 // truncate the values.
 #![allow(clippy::cast_possible_truncation)]
-#![cfg(target_pointer_width = "64")]
 
-use core::{cell, cmp, fmt, hint, ops, ptr, sync::atomic};
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("block stream works only on 64-bit platforms");
 
-use std::{error, io};
+use core::{cell::UnsafeCell, cmp, ops::Range, ops::RangeInclusive, sync::atomic};
+
+use std::io;
 
 /// Something that can be subdivided into blocks, each being a single unit of
 /// operation.
@@ -160,7 +162,7 @@ macro_rules! data_section {
 #[derive()] // manual: Debug
 pub struct Stream<B> {
     /// A series of blocks.
-    blocks: cell::UnsafeCell<B>,
+    blocks: UnsafeCell<B>,
     /// Size of the data section of each block.
     data_section_size: u64,
 
@@ -232,9 +234,9 @@ pub struct Stream<B> {
     // test copy_16m_linear  ... bench:  57,419,645 ns/iter (+/- 5,056,722)
     // test copy_32m_linear  ... bench: 161,909,575 ns/iter (+/- 1,913,318)
     /// A contiguous buffer of meta sections of `blocks`.
-    meta_buffer: cell::UnsafeCell<Vec<u8>>,
+    meta_buffer: UnsafeCell<Vec<u8>>,
     /// A contiguous buffer of data sections of `blocks`.
-    data_buffer: cell::UnsafeCell<Vec<u8>>,
+    data_buffer: UnsafeCell<Vec<u8>>,
 
     /// The current position in `data_buffer`, indicating the offset up to
     /// which the data has been appended to the buffer.
@@ -386,7 +388,7 @@ impl<B: Blocks> Stream<B> {
     /// the end block is the start of the last append. The returned range is
     /// safe to pass to [`Stream::data_range_for`] to get the actual data.
     #[must_use]
-    pub fn data_block_range(&self) -> ops::RangeInclusive<usize> {
+    pub fn data_block_range(&self) -> RangeInclusive<usize> {
         let data_range = self.data_range();
         let start_block = data_range.start / self.data_section_size as usize;
         let end_block = {
@@ -450,7 +452,7 @@ impl<B: Blocks> Stream<B> {
     ///
     /// If block is greater or equals to `block_count` an error with that block
     /// number is returned.
-    pub fn data_range_for(&self, block: usize) -> Result<ops::Range<usize>, usize> {
+    pub fn data_range_for(&self, block: usize) -> Result<Range<usize>, usize> {
         if block >= self.block_count() as usize {
             return Err(block);
         }
@@ -562,7 +564,7 @@ impl<B: Blocks> Stream<B> {
         Self::verify_append(bytes)?;
         assert_eq!(
             lock.0 as *const atomic::AtomicBool,
-            ptr::addr_of!(self.locked),
+            core::ptr::addr_of!(self.locked),
             "unrelated lock",
         );
 
@@ -732,7 +734,7 @@ impl<B: Blocks> Stream<B> {
         // When appending to the stream, the integrity is guaranteed by the code.
         assert_eq!(
             lock.0 as *const atomic::AtomicBool,
-            ptr::addr_of!(self.locked),
+            core::ptr::addr_of!(self.locked),
             "unrelated lock",
         );
 
@@ -928,7 +930,7 @@ impl<B: Blocks> Stream<B> {
     fn sync_locked(&self, lock: &Lock) -> io::Result<()> {
         assert_eq!(
             lock.0 as *const atomic::AtomicBool,
-            ptr::addr_of!(self.locked),
+            core::ptr::addr_of!(self.locked),
             "unrelated lock",
         );
 
@@ -1112,8 +1114,8 @@ impl<B: Blocks> From<B> for Stream<B> {
     }
 }
 
-impl<B> fmt::Debug for Stream<B> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<B> core::fmt::Debug for Stream<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         // SAFETY: Meta buffer length is fixed after stream has been created.
         let meta_buffer_len = unsafe { &(*self.meta_buffer.get()) }.len();
         f.debug_struct("blockstream")
@@ -1148,10 +1150,10 @@ pub enum StreamError {
     SpilledAfterFirstAppend,
 }
 
-impl error::Error for StreamError {}
+impl std::error::Error for StreamError {}
 
-impl fmt::Display for StreamError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl core::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::AppendTooLarge(limit) => {
                 write!(f, "blockstream: append exceeds the limit of {limit} bytes")
@@ -1296,7 +1298,7 @@ impl<B> Stream<B> {
     /// any spilled data at the start or trailing data at the end.
     #[inline(always)]
     #[must_use]
-    fn data_range(&self) -> ops::Range<usize> {
+    fn data_range(&self) -> Range<usize> {
         let end = cmp::min(
             // Relaxed, because data_buffer is append-only and synced position
             // is guaranteed to contain the data fully written to it.
@@ -1489,7 +1491,7 @@ impl<B: Blocks> LockedStream<'_, B> {
     }
 }
 
-impl<B> ops::Deref for LockedStream<'_, B> {
+impl<B> core::ops::Deref for LockedStream<'_, B> {
     type Target = Stream<B>;
 
     #[inline(always)]
@@ -1511,7 +1513,7 @@ impl<'a> Lock<'a> {
             if let Some(lock) = Self::try_acquire(locked) {
                 return lock;
             }
-            hint::spin_loop();
+            core::hint::spin_loop();
         }
     }
 
@@ -1530,7 +1532,7 @@ impl<'a> Lock<'a> {
     }
 }
 
-impl ops::Drop for Lock<'_> {
+impl Drop for Lock<'_> {
     /// Releases the underlying lock.
     ///
     /// # Panics
@@ -2499,11 +2501,8 @@ mod tests {
         stream.load().unwrap();
         verify_stream!(stream, Inconsistency::EmptyNonZeroParity(3));
         let err = stream.initialize().expect_err(case);
-        assert_eq!(
-            err.to_string(),
-            "blockstream: parity mismatch: meta section corrupted?",
-            "{case}",
-        );
+        let msg = "blockstream: parity mismatch: meta section corrupted?";
+        assert_eq!(err.to_string(), msg, "{case}",);
 
         let case = "zero parity on incomplete block should fail";
         write_meta!(stream.blocks.get_mut(); !3 8 0 8);
@@ -2511,55 +2510,40 @@ mod tests {
         stream.load().unwrap();
         verify_stream!(stream, Inconsistency::MetaParityMismatch(3));
         let err = stream.initialize().expect_err(case);
-        assert_eq!(
-            err.to_string(),
-            "blockstream: parity mismatch: meta section corrupted?",
-            "{case}",
-        );
+        let msg = "blockstream: parity mismatch: meta section corrupted?";
+        assert_eq!(err.to_string(), msg, "{case}",);
 
         let case = "bad crc32 on incomplete block should fail";
         write_meta!(stream.blocks.get_mut(); !3 8 0 0);
         stream.load().unwrap();
         verify_stream!(stream, Inconsistency::DataChecksumMismatch(3));
         let err = stream.initialize().expect_err(case);
-        assert_eq!(
-            err.to_string(),
-            "blockstream: crc32 mismatch: meta section corrupted?",
-            "{case}",
-        );
+        let msg = "blockstream: crc32 mismatch: meta section corrupted?";
+        assert_eq!(err.to_string(), msg, "{case}",);
 
         let case = "spilled bytes larger or equal to data section size should fail";
         write_meta!(stream.blocks.get_mut(); !3 80 0 80);
         stream.load().unwrap();
         verify_stream!(stream, Inconsistency::SpilledBytesTooLarge(3));
         let err = stream.initialize().expect_err(case);
-        assert_eq!(
-            err.to_string(),
-            "blockstream: offset larger than data section size: meta section corrupted?",
-            "{case}",
-        );
+        let msg = "blockstream: offset larger than data section size: meta section corrupted?";
+        assert_eq!(err.to_string(), msg, "{case}",);
 
         let case = "trail bytes larger or equal to data section size should fail";
         write_meta!(stream.blocks.get_mut(); !3 8 80 80);
         stream.load().unwrap();
         verify_stream!(stream, Inconsistency::TrailBytesTooLarge(3));
         let err = stream.initialize().expect_err(case);
-        assert_eq!(
-            err.to_string(),
-            "blockstream: offset larger than data section size: meta section corrupted?",
-            "{case}",
-        );
+        let msg = "blockstream: offset larger than data section size: meta section corrupted?";
+        assert_eq!(err.to_string(), msg, "{case}",);
 
         let case = "trail bytes smaller or equal to spilled bytes should fail";
         write_meta!(stream.blocks.get_mut(); !3 60 60 60);
         stream.load().unwrap();
         verify_stream!(stream, Inconsistency::TrailBytesTooSmall(3));
         let err = stream.initialize().expect_err(case);
-        assert_eq!(
-            err.to_string(),
-            "blockstream: inconsistent offsets: meta section corrupted?",
-            "{case}",
-        );
+        let msg = "blockstream: inconsistent offsets: meta section corrupted?";
+        assert_eq!(err.to_string(), msg, "{case}",);
 
         let case = "preceding middle block meta corruption should not fail";
         stream.blocks.get_mut().write_meta_parity(1, 0x01010101);
@@ -2574,11 +2558,8 @@ mod tests {
         stream.load().unwrap();
         verify_stream!(stream, Inconsistency::MetaParityMismatch(1 | 2));
         let err = stream.initialize().expect_err(case);
-        assert_eq!(
-            err.to_string(),
-            "blockstream: preceding block(s) malformed: meta section corrupted?",
-            "{case}"
-        );
+        let msg = "blockstream: preceding block(s) malformed: meta section corrupted?";
+        assert_eq!(err.to_string(), msg, "{case}");
 
         let case = "first block meta corruption should fail";
         stream.blocks.get_mut().write_meta_parity(0, 0x01010101);
@@ -2586,11 +2567,8 @@ mod tests {
         stream.load().unwrap();
         verify_stream!(stream, Inconsistency::MetaParityMismatch(0..=2));
         let err = stream.initialize().expect_err(case);
-        assert_eq!(
-            err.to_string(),
-            "blockstream: preceding block(s) malformed: meta section corrupted?",
-            "{case}",
-        );
+        let msg = "blockstream: preceding block(s) malformed: meta section corrupted?";
+        assert_eq!(err.to_string(), msg, "{case}",);
     }
 
     #[test]
@@ -2675,7 +2653,7 @@ mod tests {
 
         // Catch matches via flags, so it is easier to find the failed one.
         // The leftmost flag, if set, indicates that there are unmatched records.
-        let mut match_flags = 0;
+        let mut match_flags = 0b0000_0000_0000_0000_0000_0000;
         stream.verify(|status| {
             macro_rules! handle_match {
                 ($expression:expr; $($pattern:pat => $shift:literal),+) => {
@@ -2912,12 +2890,9 @@ mod tests {
         let err = stream
             .append_with_opts(test_words_as_bytes(&[]), true)
             .expect_err(case);
+        let msg = "blockstream: spilled option is allowed only on the first append";
         assert_meta!(stream.blocks.get_mut(); !0 64 0);
-        assert_eq!(
-            err.to_string(),
-            "blockstream: spilled option is allowed only on the first append",
-            "{case}"
-        );
+        assert_eq!(err.to_string(), msg, "{case}");
 
         let case = "append aligned to the block boundary";
         let mut stream = Stream::new(TestMemoryBlocks::new());
@@ -3050,7 +3025,7 @@ mod tests {
 
     #[inline(always)]
     const fn test_words_as_bytes(words: &[u64]) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 8) }
+        unsafe { core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() << 3) }
     }
 
     #[derive(Clone, Debug)]

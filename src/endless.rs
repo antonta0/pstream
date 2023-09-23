@@ -9,12 +9,14 @@
 //! configuration and still have access to previously written block streams,
 //! as long as the allocator is aware of that.
 
-use core::{borrow, cmp, fmt, hash, ops, slice, sync::atomic};
+use core::sync::atomic;
+use std::{
+    collections::VecDeque,
+    io,
+    sync::{Arc, Mutex},
+};
 
-use std::{collections, error, io, sync};
-
-use crate::block;
-use crate::Blocks;
+use crate::{block, Blocks};
 
 /// An allocator of [`Blocks`]. It is responsible for keeping track of which
 /// blocks were allocated and storing this state, so that the allocated blocks
@@ -119,7 +121,7 @@ pub struct Stream<A: BlocksAllocator> {
     /// infrequent access and to avoid keeping copies of `Arc` around.
     /// The values are unique, in that each is pointing to a unique address
     /// or is a unique instance of Blocks.
-    releasables: sync::Mutex<Vec<Option<Releasable<A::Blocks>>>>,
+    releasables: Mutex<Vec<Option<Releasable<A::Blocks>>>>,
 
     /// The underlying allocator of `Blocks`.
     allocator: A,
@@ -179,7 +181,7 @@ impl<A: BlocksAllocator> Stream<A> {
         // Drop old data completely to free up memory.
         self.streams = BlockStreams::new().into();
 
-        let mut streams = collections::VecDeque::new();
+        let mut streams = VecDeque::new();
         self.allocator.retrieve(|blocks| {
             streams.push_back(block::Stream::new(blocks));
         })?;
@@ -264,7 +266,7 @@ impl<A: BlocksAllocator> Stream<A> {
             .read()
             .streams
             .iter()
-            .map(|stream| ProxyBlockStream(sync::Arc::clone(stream)))
+            .map(|stream| ProxyBlockStream(Arc::clone(stream)))
             .collect()
     }
 
@@ -490,7 +492,7 @@ impl<A: BlocksAllocator> Stream<A> {
             let _locked = Self::lock_buffers(current);
             streams.clone_from(current);
             streams
-                .append(sync::Arc::new(stream))
+                .append(Arc::new(stream))
                 .expect("appending an empty stream should always succeed");
         });
         Ok(())
@@ -557,8 +559,7 @@ impl<A: BlocksAllocator> Stream<A> {
                 .expect("index range should always include valid streams");
             debug_assert!(
                 !releasables.iter().any(|item| match item.as_ref() {
-                    Some(Releasable::Stream(item)) =>
-                        sync::Arc::as_ptr(item) == sync::Arc::as_ptr(&stream),
+                    Some(Releasable::Stream(item)) => Arc::as_ptr(item) == Arc::as_ptr(&stream),
                     _ => false,
                 }),
                 "removed block streams are supposed to be unique"
@@ -593,8 +594,8 @@ impl<A: BlocksAllocator> Stream<A> {
         for releasable in releasables.iter_mut() {
             let result = match releasable.take() {
                 Some(Releasable::Stream(stream)) => {
-                    if sync::Arc::strong_count(&stream) == 1 {
-                        let blocks = sync::Arc::into_inner(stream)
+                    if Arc::strong_count(&stream) == 1 {
+                        let blocks = Arc::into_inner(stream)
                             .expect("releasable streams are not accessed concurrently")
                             .into_inner();
                         self.allocator.release(blocks)
@@ -655,10 +656,10 @@ impl From<StreamError> for io::Error {
     }
 }
 
-impl error::Error for StreamError {}
+impl std::error::Error for StreamError {}
 
-impl fmt::Display for StreamError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl core::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::BrokenSpan => {
                 write!(f, "endlessstream: spanned data is broken")
@@ -684,7 +685,7 @@ impl fmt::Display for StreamError {
 
 /// A proxy type to allow only certain operations on a [`block::Stream`].
 #[derive(Debug)]
-pub struct ProxyBlockStream<B>(sync::Arc<block::Stream<B>>);
+pub struct ProxyBlockStream<B>(Arc<block::Stream<B>>);
 
 // NOTE: The function signatures must match exactly what's on `block::Stream`.
 // Do not add any extra functions specific to this type.
@@ -814,7 +815,7 @@ impl<'a, B: Blocks> AppendContext<'a, B> {
     }
 }
 
-impl<B: Blocks> ops::Drop for AppendContext<'_, B> {
+impl<B: Blocks> Drop for AppendContext<'_, B> {
     /// Attempts to sync via [`AppendContext::sync`] once. Errors are ignored.
     #[inline(always)]
     fn drop(&mut self) {
@@ -1135,7 +1136,7 @@ enum SliceOrBuffer<'a> {
     Buffer(
         usize,
         usize,
-        vlock::ReadRef<'a, collections::VecDeque<Option<sync::Arc<Vec<u8>>>>, 2>,
+        vlock::ReadRef<'a, VecDeque<Option<Arc<Vec<u8>>>>, 2>,
     ),
 }
 
@@ -1151,44 +1152,44 @@ impl AsRef<[u8]> for BytesRef<'_> {
     }
 }
 
-impl borrow::Borrow<[u8]> for BytesRef<'_> {
+impl core::borrow::Borrow<[u8]> for BytesRef<'_> {
     #[inline(always)]
     fn borrow(&self) -> &[u8] {
         self
     }
 }
 
-impl cmp::Eq for BytesRef<'_> {}
+impl Eq for BytesRef<'_> {}
 
-impl hash::Hash for BytesRef<'_> {
+impl core::hash::Hash for BytesRef<'_> {
     #[inline(always)]
-    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.as_ref().hash(state);
     }
 }
 
-impl cmp::Ord for BytesRef<'_> {
+impl Ord for BytesRef<'_> {
     #[inline(always)]
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         self.as_ref().cmp(other.as_ref())
     }
 }
 
-impl cmp::PartialEq<BytesRef<'_>> for BytesRef<'_> {
+impl PartialEq<BytesRef<'_>> for BytesRef<'_> {
     #[inline(always)]
     fn eq(&self, other: &BytesRef<'_>) -> bool {
         self.as_ref() == other.as_ref()
     }
 }
 
-impl cmp::PartialOrd<BytesRef<'_>> for BytesRef<'_> {
+impl PartialOrd<BytesRef<'_>> for BytesRef<'_> {
     #[inline(always)]
-    fn partial_cmp(&self, other: &BytesRef<'_>) -> Option<cmp::Ordering> {
+    fn partial_cmp(&self, other: &BytesRef<'_>) -> Option<core::cmp::Ordering> {
         self.as_ref().partial_cmp(other.as_ref())
     }
 }
 
-impl ops::Deref for BytesRef<'_> {
+impl core::ops::Deref for BytesRef<'_> {
     type Target = [u8];
 
     #[inline(always)]
@@ -1216,7 +1217,7 @@ pub struct Stats(Vec<BlockStreamStats>);
 impl Stats {
     /// Returns an iterator over stats about individual [`block::Stream`].
     #[inline(always)]
-    pub fn iter(&self) -> slice::Iter<'_, BlockStreamStats> {
+    pub fn iter(&self) -> core::slice::Iter<'_, BlockStreamStats> {
         self.0.iter()
     }
 
@@ -1294,7 +1295,7 @@ impl BlockStreamStats {
 #[derive(Debug)]
 enum Releasable<B> {
     Blocks(B),
-    Stream(sync::Arc<block::Stream<B>>),
+    Stream(Arc<block::Stream<B>>),
 }
 
 /// A sequence of [`block::Stream`]. It has two main purposes. First, it
@@ -1305,14 +1306,14 @@ enum Releasable<B> {
 struct BlockStreams<B> {
     /// Block streams wrapped in Arc to allow quick cloning.
     /// After a first empty stream, all subsequent streams are empty.
-    streams: collections::VecDeque<sync::Arc<block::Stream<B>>>,
+    streams: VecDeque<Arc<block::Stream<B>>>,
 
     /// Buffers that store data that spans block streams stitched together
     /// into contiguous byte stream. Each buffer is created once either during
     /// `append` or a spanned append to the stream via `set_buffer`, and is
     /// dropped when block stream that hold the trail part is removed. The
     /// collection is under a lock to allow mutation via `set_buffer`.
-    buffers: vlock::VLock<collections::VecDeque<Option<sync::Arc<Vec<u8>>>>, 2>,
+    buffers: vlock::VLock<VecDeque<Option<Arc<Vec<u8>>>>, 2>,
 
     /// Cumulative number of streams and sum of all bytes removed so far.
     /// Used to recover the current offsets in streams. This allows for the
@@ -1376,10 +1377,7 @@ impl<B> BlockStreams<B> {
     /// Panics if `stream` is uninitialized or has length trailing bytes equal
     /// to the data capacity of the stream.
     #[inline(always)]
-    fn append(
-        &mut self,
-        stream: sync::Arc<block::Stream<B>>,
-    ) -> Result<(), sync::Arc<block::Stream<B>>> {
+    fn append(&mut self, stream: Arc<block::Stream<B>>) -> Result<(), Arc<block::Stream<B>>> {
         assert!(
             stream.trailing().len() != stream.capacity(),
             "append uninitialized, or with trail too large"
@@ -1390,7 +1388,7 @@ impl<B> BlockStreams<B> {
                 Ok(buffer) => buffer,
                 Err(()) => return Err(stream),
             }
-            .and_then(|buffer| buffers.back_mut().unwrap().replace(sync::Arc::new(buffer)));
+            .and_then(|buffer| buffers.back_mut().unwrap().replace(Arc::new(buffer)));
             assert_eq!(buffer, None);
         }
         self.streams.push_back(stream);
@@ -1401,7 +1399,7 @@ impl<B> BlockStreams<B> {
     /// Attempts to remove a stream from the front, returning `None` if there
     /// is nothing to remove.
     #[inline(always)]
-    fn remove(&mut self) -> Option<sync::Arc<block::Stream<B>>> {
+    fn remove(&mut self) -> Option<Arc<block::Stream<B>>> {
         self.buffers.get_mut().pop_front().map(|buffer| {
             let stream = self.streams.pop_front().unwrap();
             self.removed.0 += 1;
@@ -1539,7 +1537,7 @@ impl<B> BlockStreams<B> {
             |current| current[pos].is_none(),
             move |current, buffers| {
                 buffers.clone_from(current);
-                buffers[pos] = buffer.map(sync::Arc::new);
+                buffers[pos] = buffer.map(Arc::new);
             },
         )
     }
@@ -1729,21 +1727,21 @@ impl<B> Default for BlockStreams<B> {
     #[inline(always)]
     fn default() -> Self {
         Self {
-            streams: collections::VecDeque::default(),
-            buffers: collections::VecDeque::default().into(),
+            streams: VecDeque::default(),
+            buffers: VecDeque::default().into(),
             removed: (0, 0),
         }
     }
 }
 
-impl<B> TryFrom<collections::VecDeque<block::Stream<B>>> for BlockStreams<B> {
-    type Error = collections::VecDeque<block::Stream<B>>;
+impl<B> TryFrom<VecDeque<block::Stream<B>>> for BlockStreams<B> {
+    type Error = VecDeque<block::Stream<B>>;
 
-    fn try_from(mut value: collections::VecDeque<block::Stream<B>>) -> Result<Self, Self::Error> {
+    fn try_from(mut value: VecDeque<block::Stream<B>>) -> Result<Self, Self::Error> {
         let mut streams = Self::new();
         while let Some(stream) = value.pop_front() {
-            if let Err(stream) = streams.append(sync::Arc::new(stream)) {
-                value.push_front(sync::Arc::into_inner(stream).unwrap());
+            if let Err(stream) = streams.append(Arc::new(stream)) {
+                value.push_front(Arc::into_inner(stream).unwrap());
                 return Err(value);
             }
         }
@@ -1771,14 +1769,17 @@ fn make_span_buffer(trail: &[u8], spill: &[u8]) -> Result<Option<Vec<u8>>, ()> {
 #[cfg(test)]
 mod tests {
     use core::{mem, time};
-    use std::io::{Read, Seek, Write};
-    use std::thread;
+    use std::{
+        io::{Read, Seek, Write},
+        sync::mpsc,
+        thread,
+    };
 
     use super::*;
 
     macro_rules! assert_waits {
         ($what:expr, $until:expr, $($args:tt)+) => {
-            let (tx, rx) = sync::mpsc::channel();
+            let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
                 tx.send(false).unwrap();
                 $what;
@@ -1794,7 +1795,7 @@ mod tests {
 
     macro_rules! blockstreams {
         ($($kind:tt),+) => {{
-            let mut streams = collections::VecDeque::new();
+            let mut streams = VecDeque::new();
             let mut iter = (1..).peekable();
             $(
                 streams.push_back(blockstreams!(@$kind &mut iter));
@@ -2133,8 +2134,7 @@ mod tests {
         assert_eq!(stream.stats().iter().count(), 3, "{case}");
 
         let case = "load from empty";
-        let mut stream =
-            Stream::<TestMemoryBlocksAllocator>::new(collections::VecDeque::new().into());
+        let mut stream = Stream::<TestMemoryBlocksAllocator>::new(VecDeque::new().into());
         stream.load().expect(case);
         assert_eq!(stream.stats().iter().count(), 0, "{case}");
     }
@@ -2368,7 +2368,7 @@ mod tests {
     fn stream_grow() {
         let mut stream = Stream::<TestMemoryBlocksAllocator>::new(blockstreams!(ff, fe).into());
         stream.load().unwrap();
-        let stream = sync::Arc::new(stream);
+        let stream = Arc::new(stream);
         // Hold onto a chunk to simulate concurrent reads.
         let mut iter = stream.iter();
         let chunk = iter.next().unwrap();
@@ -2379,14 +2379,14 @@ mod tests {
         assert_eq!(stream.stats().data_capacity(), 3 * 1280, "{case}");
 
         let case = "growing waits for readers";
-        let stream_clone = sync::Arc::clone(&stream);
+        let stream_clone = Arc::clone(&stream);
         assert_waits!(stream_clone.grow().expect(case), drop(chunk), "{case}");
         assert_eq!(stream.stats().data_capacity(), 4 * 1280, "{case}");
 
         let case = "growing waits for locked buffers";
         let streams = stream.streams.read();
         let locked = Stream::<TestMemoryBlocksAllocator>::lock_buffers(&streams).unwrap();
-        let stream_clone = sync::Arc::clone(&stream);
+        let stream_clone = Arc::clone(&stream);
         assert_waits!(stream_clone.grow().expect(case), drop(locked), "{case}");
         assert_eq!(stream.stats().data_capacity(), 5 * 1280, "{case}");
     }
@@ -2396,7 +2396,7 @@ mod tests {
         let mut stream =
             Stream::<TestMemoryBlocksAllocator>::new(blockstreams!(ft, sp, fp, fp, fe, fe).into());
         stream.load().unwrap();
-        let stream = sync::Arc::new(stream);
+        let stream = Arc::new(stream);
         // Hold onto a chunk to simulate concurrent reads.
         let mut iter = stream.iter();
         let chunk = iter.next().unwrap();
@@ -2422,7 +2422,7 @@ mod tests {
         let case = "shrinking waits for readers and removes two block streams";
         while iter.next().is_some() {}
         assert!(stream.advance(iter.advance_context()));
-        let stream_clone = sync::Arc::clone(&stream);
+        let stream_clone = Arc::clone(&stream);
         assert_waits!(
             assert_eq!(stream_clone.maybe_shrink(), (2, 2 * 1152 - 16), "{case}"),
             drop(chunk),
@@ -2444,7 +2444,7 @@ mod tests {
         assert!(iter.next().is_none(), "{case}");
         let streams = stream.streams.read();
         let locked = Stream::<TestMemoryBlocksAllocator>::lock_buffers(&streams).unwrap();
-        let stream_clone = sync::Arc::clone(&stream);
+        let stream_clone = Arc::clone(&stream);
         assert_waits!(
             assert_eq!(stream_clone.maybe_shrink(), (1, 1280), "{case}"),
             drop(locked),
@@ -2459,7 +2459,7 @@ mod tests {
         let mut stream =
             Stream::<TestMemoryBlocksAllocator>::new(blockstreams!(ft, sp, fp, fp, fe, fe).into());
         stream.load().unwrap();
-        let stream = sync::Arc::new(stream);
+        let stream = Arc::new(stream);
         let mut iter = stream.iter();
         iter.next().unwrap();
         iter.next().unwrap();
@@ -2586,7 +2586,7 @@ mod tests {
     fn blockstreams_append_uninitialized() {
         let mut streams = BlockStreams::new();
         streams
-            .append(sync::Arc::new(block::Stream::new(TestMemoryBlocks::new())))
+            .append(Arc::new(block::Stream::new(TestMemoryBlocks::new())))
             .unwrap();
     }
 
@@ -2989,7 +2989,7 @@ mod tests {
         let case = "set after append";
         let mut stream = block::Stream::new(TestMemoryBlocks::new());
         stream.initialize().unwrap();
-        streams.append(sync::Arc::new(stream)).unwrap();
+        streams.append(Arc::new(stream)).unwrap();
         let updated = unsafe { streams.set_buffer(3, &[0x05, 0x06], &[0x07, 0x08]) };
         assert!(updated, "{case}");
         let buffer = get_buffer!(streams, 0).expect(case);
@@ -3078,7 +3078,7 @@ mod tests {
     }
 
     fn test_generate_blockstream(
-        iter: &mut std::iter::Peekable<impl Iterator<Item = u64>>,
+        iter: &mut core::iter::Peekable<impl Iterator<Item = u64>>,
         take: usize,
         flags: u8,
     ) -> block::Stream<TestMemoryBlocks> {
@@ -3122,7 +3122,7 @@ mod tests {
         SearchControl::SearchRight
     }
 
-    struct TestMemoryBlocksAllocator(sync::Mutex<Vec<Option<TestMemoryBlocks>>>);
+    struct TestMemoryBlocksAllocator(Mutex<Vec<Option<TestMemoryBlocks>>>);
 
     unsafe impl BlocksAllocator for TestMemoryBlocksAllocator {
         type Blocks = TestMemoryBlocks;
@@ -3157,8 +3157,8 @@ mod tests {
         }
     }
 
-    impl From<collections::VecDeque<block::Stream<TestMemoryBlocks>>> for TestMemoryBlocksAllocator {
-        fn from(mut value: collections::VecDeque<block::Stream<TestMemoryBlocks>>) -> Self {
+    impl From<VecDeque<block::Stream<TestMemoryBlocks>>> for TestMemoryBlocksAllocator {
+        fn from(mut value: VecDeque<block::Stream<TestMemoryBlocks>>) -> Self {
             let mut blocks = Vec::with_capacity(value.len());
             for stream in value.drain(..) {
                 blocks.push(Some(stream.into_inner()));
@@ -3224,7 +3224,7 @@ mod tests {
         }
     }
 
-    impl ops::Drop for TestMemoryBlocks {
+    impl Drop for TestMemoryBlocks {
         #[inline(always)]
         fn drop(&mut self) {
             if let TestMaybeDrop::Manual(ref mut cursor) = self.0 {
@@ -3240,7 +3240,7 @@ mod tests {
         Manual(mem::ManuallyDrop<T>),
     }
 
-    impl<T> ops::Deref for TestMaybeDrop<T> {
+    impl<T> core::ops::Deref for TestMaybeDrop<T> {
         type Target = T;
 
         #[inline(always)]
@@ -3252,7 +3252,7 @@ mod tests {
         }
     }
 
-    impl<T> ops::DerefMut for TestMaybeDrop<T> {
+    impl<T> core::ops::DerefMut for TestMaybeDrop<T> {
         #[inline(always)]
         fn deref_mut(&mut self) -> &mut T {
             match self {
