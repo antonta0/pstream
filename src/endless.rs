@@ -576,45 +576,59 @@ impl<A: BlocksAllocator> Stream<A> {
 
     /// Attempts to release blocks backing up previously removed block streams
     /// during [`Stream::maybe_shrink`]. This function always returns the number
-    /// of blocks released and remaining in the queue, and will call `error`
-    /// function if [`BlocksAllocator::release`] returns an error.
+    /// of blocks released via allocator and remaining in the queue.
+    ///
+    /// This call does not interfere with readers, appends, and even `grow`
+    /// calls, but shares state with `maybe_shrink` under a mutually exclusive
+    /// lock.
+    ///
+    /// # Errors
+    ///
+    /// The third return value is optionally set to the error encountered during
+    /// [`BlocksAllocator::release`].
     ///
     /// On error, blocks that failed are put back into a queue. The order in
     /// which blocks are attempted to be released is the same, as the order
     /// they were removed from this stream.
     ///
     /// Note, that the memory backing up a block stream is released despite
-    /// the error.
-    ///
-    /// This call does not interfere with readers, appends, and even `grow`
-    /// calls, but shares state with `maybe_shrink` under a mutually exclusive
-    /// lock.
-    pub fn try_release(&self, mut error: impl FnMut(io::Error)) -> (usize, usize) {
+    /// the error returned by the underlying allocator.
+    pub fn try_release(&self) -> (usize, usize, Option<io::Error>) {
         let mut releasables = self.releasables.lock().expect("should not poison");
         for releasable in releasables.iter_mut() {
-            let result = match releasable.take() {
-                Some(Releasable::Stream(stream)) => {
-                    if Arc::strong_count(&stream) == 1 {
-                        let blocks = Arc::into_inner(stream)
-                            .expect("releasable streams are not accessed concurrently")
-                            .into_inner();
-                        self.allocator.release(blocks)
-                    } else {
-                        releasable.replace(Releasable::Stream(stream));
-                        continue;
+            if let Some(Releasable::Stream(ref stream)) = releasable {
+                if Arc::strong_count(stream) != 1 {
+                    continue;
+                }
+                if let Some(Releasable::Stream(stream)) = releasable.take() {
+                    let blocks = Arc::into_inner(stream)
+                        .expect("releasable streams are not accessed concurrently")
+                        .into_inner();
+                    releasable.replace(Releasable::Blocks(blocks));
+                }
+            }
+        }
+        let mut error = None;
+        for releasable in releasables.iter_mut() {
+            match releasable.take() {
+                Some(stream @ Releasable::Stream(_)) => {
+                    releasable.replace(stream);
+                }
+                Some(Releasable::Blocks(blocks)) => {
+                    if let Err((blocks, err)) = self.allocator.release(blocks) {
+                        releasable.replace(Releasable::Blocks(blocks));
+                        error.replace(err);
                     }
                 }
-                Some(Releasable::Blocks(blocks)) => self.allocator.release(blocks),
                 None => unreachable!(),
-            };
-            if let Err((blocks, err)) = result {
-                releasable.replace(Releasable::Blocks(blocks));
-                error(err);
+            }
+            if error.is_some() {
+                break;
             }
         }
         let length = releasables.len();
         releasables.retain(Option::is_some);
-        (length - releasables.len(), releasables.len())
+        (length - releasables.len(), releasables.len(), error)
     }
 
     /// Forces a release of removed block streams from a queue. Unlike
@@ -622,14 +636,14 @@ impl<A: BlocksAllocator> Stream<A> {
     /// and will compete with [`Stream::grow`].
     ///
     /// If some readers hold onto removed blocks, this call will block.
-    pub fn force_release(&self, error: impl FnMut(io::Error)) -> (usize, usize) {
+    pub fn force_release(&self) -> (usize, usize, Option<io::Error>) {
         // Make use of the fact that there are only 2 versions. Just make
         // the old version drop references to the removed block streams.
         self.streams.update_default(|current, streams| {
             let _locked = Self::lock_buffers(current);
             streams.clone_from(current);
         });
-        self.try_release(error)
+        self.try_release()
     }
 }
 
@@ -2467,17 +2481,18 @@ mod tests {
         let case = "recently removed are not released";
         assert!(stream.advance(iter.advance_context()));
         assert_eq!(stream.maybe_shrink(), (1, 1296), "{case}");
-        assert_eq!(stream.try_release(|_| ()), (0, 1), "{case}");
+        // FUTURE: Use assert_matches once stable
+        assert!(matches!(stream.try_release(), (0, 1, None)), "{case}");
 
         let case = "removed after changing streams are released";
         stream.grow().unwrap();
-        assert_eq!(stream.try_release(|_| ()), (1, 0), "{case}");
+        assert!(matches!(stream.try_release(), (1, 0, None)), "{case}");
 
         let case = "recently removed are released immediately if forced";
         iter.next().unwrap();
         assert!(stream.advance(iter.advance_context()));
         assert_eq!(stream.maybe_shrink(), (1, 1152 - 16), "{case}");
-        assert_eq!(stream.force_release(|_| ()), (1, 0), "{case}");
+        assert!(matches!(stream.force_release(), (1, 0, None)), "{case}");
     }
 
     #[test]
