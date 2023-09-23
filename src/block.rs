@@ -261,11 +261,12 @@ impl<B: Blocks> Stream<B> {
     ///
     /// # Panics
     ///
-    /// Panics if `B` has zero `block_count` or when `block_shift` is greater
-    /// than or equal to 28.
+    /// Panics if `B` has zero `block_count` or when `block_shift` is less
+    /// than 6 or greater than or equal to 28.
     #[must_use]
     pub fn new(blocks: B) -> Self {
         assert_ne!(blocks.block_count(), 0, "blocks have no blocks?");
+        assert!(blocks.block_shift() >= 6, "block shift too small");
         assert!(
             blocks.block_shift() < AboutBlock::TRAIL_BITS,
             "block shift too big"
@@ -1563,9 +1564,10 @@ impl Drop for Lock<'_> {
 ///
 /// The state is encoded in the following way:
 /// ```text
-/// +---+---------------------------+-+-----------------------------+
-/// | A |             B             |C|             D               |
-/// +---+---------------------------+-+-----------------------------+
+///   00  04  08  0c  10  14  18  1c  20  24  28  2c  30  34  38  3c  40
+/// ++---+---------------------------+-+------------------------------++
+/// || A |            B              |C|              D               ||
+/// ++---+---------------------------+-+------------------------------++
 ///
 /// A (4 bits) = Only 1 bit is used to indicate whether the block is complete.
 /// B (28 bits) = If block is complete, this is the size in bytes of the
@@ -1823,6 +1825,31 @@ mod tests {
             }
         }
         let _ = Stream::new(EmptyBlocks);
+    }
+
+    #[test]
+    #[should_panic(expected = "block shift too small")]
+    fn stream_new_small() {
+        struct SmallBlocks;
+        impl Blocks for SmallBlocks {
+            fn block_count(&self) -> u64 {
+                1
+            }
+            fn block_shift(&self) -> u32 {
+                5
+            }
+            fn load_from(
+                &mut self,
+                _block: u64,
+                _bufs: &mut [io::IoSliceMut<'_>],
+            ) -> io::Result<()> {
+                unimplemented!()
+            }
+            fn store_at(&mut self, _block: u64, _bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+                unimplemented!()
+            }
+        }
+        let _ = Stream::new(SmallBlocks);
     }
 
     #[test]
