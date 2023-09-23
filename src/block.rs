@@ -311,6 +311,9 @@ impl<B: Blocks> Stream<B> {
     /// Returns [`StreamError::MetaSectionCorrupted`] if metadata is
     /// inconsistent. In this case, more detailed status can be retrieved by
     /// running a more expensive [`Stream::verify`].
+    ///
+    /// Note, that the verification of the stream is not complete, and if some
+    /// blocks in the middle are damaged it won't be noticed via this path.
     pub fn initialize(&mut self) -> Result<(), StreamError> {
         // SAFETY: Exclusive access is guaranteed by the borrow checker.
         let block = unsafe { self.find_ending_block() };

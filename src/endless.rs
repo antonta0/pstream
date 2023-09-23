@@ -76,11 +76,11 @@ pub unsafe trait BlocksAllocator {
 /// guarantees that dirty data is never read.
 ///
 /// The stream has an internal offset, which points to the start of relevant
-/// data within the stream. The offset is set during initialization and then
-/// updated during runtime when needed. It is up to the caller to recover
-/// the offset after restarts, as this heavily depends on the usage patterns.
-/// Block streams that are no longer reachable as the offset has been advanced
-/// far enough can be released.
+/// data within the stream. The offset is set via [`Stream::set_offset`] and
+/// then updated during runtime when needed via [`Stream::advance`]. It is up
+/// to the caller to recover the offset after restarts, as this heavily depends
+/// on the usage patterns. Block streams that are no longer reachable as the
+/// offset has been advanced far enough can be released.
 ///
 /// The only interface to access the data is through [`Stream::iter`]. See the
 /// function and the relevant type documentation for details.
@@ -106,7 +106,7 @@ pub struct Stream<A: BlocksAllocator> {
     /// The offset in bytes within this stream, including the size of the data
     /// from removed blocks. This means that the value is always incrementing
     /// and never goes backwards. This state is not persistent and must be
-    /// recovered during `initialize`.
+    /// recovered.
     offset: atomic::AtomicUsize,
 
     /// A collection of block streams, where new ones are allocated as needed.
@@ -509,7 +509,7 @@ impl<A: BlocksAllocator> Stream<A> {
     /// state under a shared lock.
     ///
     /// Neither the underlying blocks, nor the memory backing the block stream
-    /// is released immediately, instead block streams are are put into a queue.
+    /// is released immediately, instead block streams are put into a queue.
     /// To release, call [`Stream::try_release`] or [`Stream::force_release`],
     /// which will clear the memory and attempt to release the blocks.
     pub fn maybe_shrink(&self) -> (usize, usize) {
@@ -895,10 +895,10 @@ impl<'a, B> Iter<'a, B> {
 
     /// Rewinds the iterator back by `dec` bytes, allowing repeated reads without
     /// rebuilding the iterator. This can be thought of as an alternative to
-    /// [`std::io::Seek`], except that it goes backwards only and the iterator
-    /// provides direct access to the buffer. Returns `false` if rewind failed
-    /// because the stream advanced further than the state of the iterator,
-    /// which is equivalent to a skipped chunk in `next`.
+    /// [`std::io::Seek`], except that it goes backwards only and is part of an
+    /// iterator over buffers. Returns `false` if rewind failed because the
+    /// stream advanced further than the state of the iterator, which is
+    /// equivalent to a skipped chunk in `next`.
     ///
     /// If `dec` is larger than the bytes read, it will rewind to the original
     /// offset, which is equivalent to resetting the iterator.
