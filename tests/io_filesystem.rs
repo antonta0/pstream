@@ -234,12 +234,12 @@ fn filesequence_open() -> io::Result<()> {
     let case = "comparison out of range fails";
     fileseq.alloc()?;
     fileseq.close()?;
-    with_dummy_file(root.join("filesequence_open.4001-12"), || {
+    with_dummy_file(root.join("filesequence_open.4002-12"), || {
         let err_msg = FileSequence::open(&root, "filesequence_open", 2, 12)
             .expect_err(case)
             .to_string();
         let msg1 = "filesequence: index 0x0001 out of range";
-        let msg2 = "filesequence: index 0x4001 out of range";
+        let msg2 = "filesequence: index 0x4002 out of range";
         if err_msg != msg1 && err_msg != msg2 {
             panic!("{case}: no match for message: {err_msg}");
         }
@@ -437,7 +437,7 @@ fn filesequence_wrapping() -> io::Result<()> {
     fileseq.close()?;
 
     let case = "open wrapping";
-    let fileseq = FileSequence::open(&root, "filesequence_wrapping", 2, 12)?;
+    let fileseq = FileSequence::open(&root, "filesequence_wrapping", 2, 12).expect(case);
     let mut count = 0;
     fileseq.retrieve(|_| count += 1).expect(case);
     assert_eq!(count, 5, "{case}");

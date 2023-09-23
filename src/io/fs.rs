@@ -958,16 +958,19 @@ impl FileSequence {
                     continue;
                 }
                 let (index, _) = FileSequence::parse_opts(opts.to_str().unwrap_or_default())?;
-                if index < *start.get_or_insert(index) {
+                let start_index = *start.get_or_insert(index);
+                let end_index = *end.get_or_insert(index.inc());
+                if index >= start_index && index < end_index {
+                    continue;
+                } else if index < start_index {
                     start.replace(index);
-                } else if index >= *end.get_or_insert(index) {
+                } else if index >= end_index {
                     end.replace(index.inc());
                 } else {
                     return Err(FileSequenceError::OutOfRange(index.into()).into());
                 }
             }
         }
-        assert!(!(start.is_none() ^ end.is_none()));
         start
             .zip(end)
             .map(|(start, end)| match start.partial_cmp(&end) {
