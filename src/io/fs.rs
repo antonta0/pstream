@@ -529,7 +529,7 @@ impl File {
                         // not violate the non-overlapping property.
                         io::IoSliceMut::new(unsafe {
                             // Get a mutable borrow to bytes by creating a new slice.
-                            core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, buf.len())
+                            core::slice::from_raw_parts_mut(buf.as_ptr().cast_mut(), buf.len())
                         })
                     });
                     self.free_cached_pages(current, read as u64)?;
@@ -663,7 +663,7 @@ impl File {
                         // not violate the non-overlapping property.
                         io::IoSliceMut::new(unsafe {
                             // Get a mutable borrow to bytes by creating a new slice.
-                            core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, buf.len())
+                            core::slice::from_raw_parts_mut(buf.as_ptr().cast_mut(), buf.len())
                         })
                     });
                 }
@@ -1036,7 +1036,7 @@ impl FileSequence {
         // function returns. In case of a LockFile, the actual file is not
         // double-released on drop. As for Dir, the errors are not expected
         // on drop and it will panic if encounters one.
-        self.lock.release().and_then(|_| self.root.sync())
+        self.lock.release().and_then(|()| self.root.sync())
     }
 
     /// A convenience function to build the full path of the file in sequence.
@@ -1155,7 +1155,8 @@ unsafe impl BlocksAllocator for FileSequence {
         }
 
         let Some(index) = blocks.index else {
-            return Err((blocks, FileSequenceError::Unrecognized.into())) };
+            return Err((blocks, FileSequenceError::Unrecognized.into()));
+        };
         // Taking relaxed order, because only the atomic value is relevant.
         // The callers are not supposed to pass the value with the same index
         // in arguments, and even if they do, only one of them would succeed.
@@ -1171,11 +1172,11 @@ unsafe impl BlocksAllocator for FileSequence {
         // retry will fail because the counter has not been incremented.
         let path = self.get_filename(index, blocks.block_shift);
         match fs::remove_file(path) {
-            Ok(_) => {}
+            Ok(()) => {}
             Err(err) => return Err((blocks, err)),
         }
         match self.root.sync() {
-            Ok(_) => {}
+            Ok(()) => {}
             // Returns blocks that don't have the file anymore. That should be
             // alright. The file still has the open descriptor.
             Err(err) => return Err((blocks, err)),

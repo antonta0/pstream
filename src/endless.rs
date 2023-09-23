@@ -512,6 +512,14 @@ impl<A: BlocksAllocator> Stream<A> {
     /// is released immediately, instead block streams are put into a queue.
     /// To release, call [`Stream::try_release`] or [`Stream::force_release`],
     /// which will clear the memory and attempt to release the blocks.
+    ///
+    /// # Panics
+    ///
+    ///
+    /// If the lock is poisoned, or internal invariants are violated for some
+    /// reason, the call will panic. In debug mode, a size of internal queue
+    /// is checked to not exceed pre-allocated capacity, and if it does, it
+    /// will panic.
     pub fn maybe_shrink(&self) -> (usize, usize) {
         // Relaxed, because operations on streams are not dependent on
         // changes to the state, hence interested only in the atomicity.
@@ -557,7 +565,7 @@ impl<A: BlocksAllocator> Stream<A> {
             let stream = stream
                 .take()
                 .expect("index range should always include valid streams");
-            debug_assert!(
+            assert!(
                 !releasables.iter().any(|item| match item.as_ref() {
                     Some(Releasable::Stream(item)) => Arc::as_ptr(item) == Arc::as_ptr(&stream),
                     _ => false,
@@ -593,6 +601,11 @@ impl<A: BlocksAllocator> Stream<A> {
     ///
     /// Note, that the memory backing up a block stream is released despite
     /// the error returned by the underlying allocator.
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned, or internal invariants are violated for some
+    /// reason, the call will panic.
     pub fn try_release(&self) -> (usize, usize, Option<io::Error>) {
         let mut releasables = self.releasables.lock().expect("should not poison");
         for releasable in releasables.iter_mut() {
@@ -806,6 +819,11 @@ impl<'a, B: Blocks> AppendContext<'a, B> {
     ///
     /// An error is returned if an IO error is encountered while calling
     /// [`block::Stream::sync`] on one of the underlying blocks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if streams that needs syncing is not available via index, which
+    /// is not supposed to happen.
     #[inline]
     pub fn sync(&mut self) -> io::Result<()> {
         if self.is_synced() {
@@ -1123,6 +1141,11 @@ impl<B> Chunk<'_, B> {
 impl<B: Blocks> Chunk<'_, B> {
     /// Returns a reference to bytes in memory, or `None` if this chunk is
     /// a skipped chunk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if stream by the index is not available, which is not supposed
+    /// to happen.
     #[inline(always)]
     #[must_use]
     pub fn bytes(&self) -> Option<BytesRef<'_>> {
@@ -3049,28 +3072,36 @@ mod tests {
     fn blockstreams_set_buffer_index_too_small() {
         let mut streams = BlockStreams::try_from(blockstreams!(fp, fp, fp)).unwrap();
         streams.remove();
-        unsafe { streams.set_buffer(0, &[], &[]) };
+        unsafe {
+            let _ = streams.set_buffer(0, &[], &[]);
+        };
     }
 
     #[test]
     #[should_panic(expected = "index too large")]
     fn blockstreams_set_buffer_index_too_large() {
         let streams = BlockStreams::try_from(blockstreams!(fp, fp, fp)).unwrap();
-        unsafe { streams.set_buffer(2, &[], &[]) };
+        unsafe {
+            let _ = streams.set_buffer(2, &[], &[]);
+        };
     }
 
     #[test]
     #[should_panic(expected = "trailing and spilled should be either empty or non-empty")]
     fn blockstreams_set_buffer_no_spilled() {
         let streams = BlockStreams::try_from(blockstreams!(fp, fp, fp)).unwrap();
-        unsafe { streams.set_buffer(0, &[0x01], &[]) };
+        unsafe {
+            let _ = streams.set_buffer(0, &[0x01], &[]);
+        };
     }
 
     #[test]
     #[should_panic(expected = "trailing and spilled should be either empty or non-empty")]
     fn blockstreams_set_buffer_no_trailing() {
         let streams = BlockStreams::try_from(blockstreams!(fp, fp, fp)).unwrap();
-        unsafe { streams.set_buffer(0, &[], &[0x01]) };
+        unsafe {
+            let _ = streams.set_buffer(0, &[], &[0x01]);
+        };
     }
 
     #[test]
@@ -3092,7 +3123,7 @@ mod tests {
 
     #[inline(always)]
     const fn test_words_as_bytes(words: &[u64]) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 8) }
+        unsafe { core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 8) }
     }
 
     #[repr(u8)]

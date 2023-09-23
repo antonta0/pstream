@@ -105,7 +105,7 @@ fn file_load_store() -> io::Result<()> {
                     }),
                     io::IoSliceMut::new(unsafe {
                         core::slice::from_raw_parts_mut(
-                            chunk.as_ptr().add(48) as *mut u8,
+                            chunk.as_ptr().add(48).cast_mut(),
                             chunk.len() - 48,
                         )
                     }),
