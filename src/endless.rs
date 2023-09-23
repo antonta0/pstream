@@ -1807,6 +1807,15 @@ mod tests {
         }
     }
 
+    // Lengths of data within kinds of block streams, where TS is the buffer.
+    const FF: usize = 1280;
+    const FT: usize = 1152;
+    const FP: usize = 1152;
+    const FE: usize = 0;
+    const SF: usize = 1280 - 16;
+    const SP: usize = 1152 - 16;
+    const TS: usize = 128 + 16;
+
     macro_rules! blockstreams {
         ($($kind:tt),+) => {{
             let mut streams = VecDeque::new();
@@ -1901,7 +1910,7 @@ mod tests {
         let stats = stream.stats();
         assert_eq!(stats.blocks_size(), 3 * 2048, "{case}");
         assert_eq!(stats.data_capacity(), 3 * 1280, "{case}");
-        assert_eq!(stats.data_used(), 1152 + 1280 + 0, "{case}");
+        assert_eq!(stats.data_used(), FP + FF + FE, "{case}");
         assert_eq!(stats.data_wasted(), 63 * 8 + 128, "{case}");
         assert_eq!(stats.data_available(), 1280, "{case}");
     }
@@ -2093,15 +2102,15 @@ mod tests {
         let mut behind = iter.clone();
         behind.rewind(64);
         assert!(stream.advance(iter.advance_context()), "{case}");
-        assert_eq!(stream.maybe_shrink(), (1, 1152), "{case}");
-        assert_eq!(bytes.len(), 1152 - 912 + 8, "{case}");
+        assert_eq!(stream.maybe_shrink(), (1, FP), "{case}");
+        assert_eq!(bytes.len(), FP - 912 + 8, "{case}");
 
         let case = "read after shrink";
         assert!(behind.next().expect(case).is_skipped(), "{case}");
         let size: usize = iter.map(|chunk| chunk.bytes().expect(case).len()).sum();
-        assert_eq!(size, 1152 + 1280, "{case}");
+        assert_eq!(size, FP + FF, "{case}");
         let size: usize = behind.map(|chunk| chunk.bytes().expect(case).len()).sum();
-        assert_eq!(size, 1152 + 1280, "{case}");
+        assert_eq!(size, FP + FF, "{case}");
     }
 
     #[test]
@@ -2125,7 +2134,7 @@ mod tests {
         let mut stream = Stream::<TestMemoryBlocksAllocator>::new(blockstreams!(fp, ff, fe).into());
         stream.load().unwrap();
         assert!(stream.set_offset(|bytes, _| test_find_word_in_stream(bytes, 114)));
-        let ctx = AdvanceContext(*stream.offset.get_mut() + 1152 - 904 + 1280 + 1);
+        let ctx = AdvanceContext(*stream.offset.get_mut() + FP - 904 + FF + 1);
         stream.advance(ctx);
     }
 
@@ -2429,7 +2438,7 @@ mod tests {
         let case = "shrink first block stream";
         iter.next().unwrap();
         assert!(stream.advance(iter.advance_context()));
-        assert_eq!(stream.maybe_shrink(), (1, 1296), "{case}");
+        assert_eq!(stream.maybe_shrink(), (1, FT + TS), "{case}");
         assert_eq!(stream.stats().data_capacity(), 5 * 1280, "{case}");
         assert_eq!(stream.releasables.lock().unwrap().len(), 1, "{case}");
 
@@ -2438,7 +2447,7 @@ mod tests {
         assert!(stream.advance(iter.advance_context()));
         let stream_clone = Arc::clone(&stream);
         assert_waits!(
-            assert_eq!(stream_clone.maybe_shrink(), (2, 2 * 1152 - 16), "{case}"),
+            assert_eq!(stream_clone.maybe_shrink(), (2, 2 * FP - 16), "{case}"),
             drop(chunk),
             "{case}"
         );
@@ -2460,7 +2469,7 @@ mod tests {
         let locked = Stream::<TestMemoryBlocksAllocator>::lock_buffers(&streams).unwrap();
         let stream_clone = Arc::clone(&stream);
         assert_waits!(
-            assert_eq!(stream_clone.maybe_shrink(), (1, 1280), "{case}"),
+            assert_eq!(stream_clone.maybe_shrink(), (1, FF), "{case}"),
             drop(locked),
             "{case}"
         );
@@ -2480,7 +2489,7 @@ mod tests {
 
         let case = "recently removed are not released";
         assert!(stream.advance(iter.advance_context()));
-        assert_eq!(stream.maybe_shrink(), (1, 1296), "{case}");
+        assert_eq!(stream.maybe_shrink(), (1, FT + TS), "{case}");
         // FUTURE: Use assert_matches once stable
         assert!(matches!(stream.try_release(), (0, 1, None)), "{case}");
 
@@ -2491,7 +2500,7 @@ mod tests {
         let case = "recently removed are released immediately if forced";
         iter.next().unwrap();
         assert!(stream.advance(iter.advance_context()));
-        assert_eq!(stream.maybe_shrink(), (1, 1152 - 16), "{case}");
+        assert_eq!(stream.maybe_shrink(), (1, SP), "{case}");
         assert!(matches!(stream.force_release(), (1, 0, None)), "{case}");
     }
 
@@ -2499,15 +2508,15 @@ mod tests {
     fn blockstreams_len() {
         let case = "with spilled at front";
         let streams = BlockStreams::try_from(blockstreams!(sp, fe, ff, fe)).unwrap();
-        assert_eq!(streams.len(), (4, 1136 + 0 + 1280 + 0), "{case}");
+        assert_eq!(streams.len(), (4, SP + FE + FF + FE), "{case}");
 
         let case = "with spanned data";
         let streams = BlockStreams::try_from(blockstreams!(sp, ft, sf, fe)).unwrap();
-        assert_eq!(streams.len(), (4, 1136 + 1296 + 1264 + 0), "{case}");
+        assert_eq!(streams.len(), (4, SP + FT + TS + SF + FE), "{case}");
 
         let case = "without spilled at front";
         let streams = BlockStreams::try_from(blockstreams!(fp, ft, sf, fe)).unwrap();
-        assert_eq!(streams.len(), (4, 1152 + 1296 + 1264 + 0), "{case}");
+        assert_eq!(streams.len(), (4, FP + FT + TS + SF + FE), "{case}");
     }
 
     #[test]
@@ -2517,7 +2526,8 @@ mod tests {
         let stats = streams.stats(88);
         assert_eq!(stats.blocks_size(), 5 * 2048, "{case}");
         assert_eq!(stats.data_capacity(), 5 * 1280, "{case}");
-        assert_eq!(stats.data_used(), 1152 + 0 + 1280 + 1152 + 0, "{case}");
+        let expected = 16 + SP + FE + FT + TS + SP + FE;
+        assert_eq!(stats.data_used(), expected, "{case}");
         assert_eq!(stats.data_wasted(), 16 + 88 + 128 + 1280 + 0, "{case}");
         assert_eq!(stats.data_available(), 1280 - 1152 + 1280, "{case}");
 
@@ -2526,7 +2536,8 @@ mod tests {
         let stats = streams.stats(1168);
         assert_eq!(stats.blocks_size(), 5 * 2048, "{case}");
         assert_eq!(stats.data_capacity(), 5 * 1280, "{case}");
-        assert_eq!(stats.data_used(), 1152 + 0 + 1280 + 1152 + 0, "{case}");
+        let expected = 16 + SP + FE + FT + TS + SP + FE;
+        assert_eq!(stats.data_used(), expected, "{case}");
         assert_eq!(stats.data_wasted(), 16 + 128 + 1280 + 1168 + 0, "{case}");
         assert_eq!(stats.data_available(), 1280 - 1152 + 1280, "{case}");
 
@@ -2535,7 +2546,7 @@ mod tests {
         let stats = streams.stats(88);
         assert_eq!(stats.blocks_size(), 5 * 2048, "{case}");
         assert_eq!(stats.data_capacity(), 5 * 1280, "{case}");
-        assert_eq!(stats.data_used(), 1152 + 0 + 1280 + 1152 + 0, "{case}");
+        assert_eq!(stats.data_used(), FP + FE + FT + TS + SP + FE, "{case}");
         assert_eq!(stats.data_wasted(), 88 + 128 + 1280 + 0, "{case}");
         assert_eq!(stats.data_available(), 1280 - 1152 + 1280, "{case}");
 
@@ -2545,7 +2556,8 @@ mod tests {
         let stats = streams.stats(88);
         assert_eq!(stats.blocks_size(), 5 * 2048, "{case}");
         assert_eq!(stats.data_capacity(), 5 * 1280, "{case}");
-        assert_eq!(stats.data_used(), 1152 + 0 + 1280 + 1152 + 0, "{case}");
+        let expected = FE + FP + FE + FT + TS + SP + FE;
+        assert_eq!(stats.data_used(), expected, "{case}");
         assert_eq!(stats.data_wasted(), 88 + 128 + 1280 + 0, "{case}");
         assert_eq!(stats.data_available(), 1280 - 1152 + 1280, "{case}");
     }
@@ -2611,19 +2623,19 @@ mod tests {
         let mut streams = BlockStreams::try_from(blockstreams!(ff, ft, sp, fe, fe)).unwrap();
         assert_eq!(streams.removed(), (0, 0), "{case}");
         streams.remove().expect(case);
-        assert_eq!(streams.removed(), (1, 1280), "{case}");
+        assert_eq!(streams.removed(), (1, FF), "{case}");
         streams.remove().expect(case);
-        assert_eq!(streams.removed(), (2, 1280 + 1280 + 16), "{case}");
+        assert_eq!(streams.removed(), (2, FF + FT + TS), "{case}");
         streams.remove().expect(case);
-        assert_eq!(streams.removed(), (3, 1280 + 1280 + 16 + 1136), "{case}");
+        assert_eq!(streams.removed(), (3, FF + FT + TS + SP), "{case}");
         streams.remove().expect(case);
-        assert_eq!(streams.removed(), (4, 1280 + 1280 + 16 + 1136), "{case}");
+        assert_eq!(streams.removed(), (4, FF + FT + TS + SP), "{case}");
         streams.remove().expect(case);
-        assert_eq!(streams.removed(), (5, 1280 + 1280 + 16 + 1136), "{case}");
+        assert_eq!(streams.removed(), (5, FF + FT + TS + SP), "{case}");
 
         let case = "remove nothing";
         assert!(streams.remove().is_none(), "{case}");
-        assert_eq!(streams.removed(), (5, 1280 + 1280 + 16 + 1136), "{case}");
+        assert_eq!(streams.removed(), (5, FF + FT + TS + SP), "{case}");
     }
 
     #[test]
@@ -2738,48 +2750,51 @@ mod tests {
         assert_eq!(streams.stream_at(1120), Some((0, 1120)), "{case}");
 
         let case = "offset within the first stream span";
-        assert_eq!(streams.get(0).unwrap().data().len(), 1152, "{case}");
-        assert_eq!(streams.stream_at(1192), Some((0, 1192)), "{case}");
+        let offset = FT + 40;
+        assert_eq!(streams.stream_at(offset), Some((0, FT + 40)), "{case}");
 
         let case = "offset within the second stream";
-        assert_eq!(streams.stream_at(1296 + 16), Some((1, 16)), "{case}");
+        let offset = FT + TS + 16;
+        assert_eq!(streams.stream_at(offset), Some((1, 16)), "{case}");
 
         let case = "offset aligned to the start of the third stream";
-        assert_eq!(streams.stream_at(1296 + 1136), Some((2, 0)), "{case}");
+        let offset = FT + TS + SP;
+        assert_eq!(streams.stream_at(offset), Some((2, 0)), "{case}");
 
         let case = "offset skipping empty streams";
-        assert_eq!(streams.stream_at(3584 + 16), Some((5, 16)), "{case}");
+        let offset = FT + TS + SP + FP + 16;
+        assert_eq!(streams.stream_at(offset), Some((5, 16)), "{case}");
 
         let case = "offset within the sixths stream span";
-        assert_eq!(streams.get(5).unwrap().data().len(), 1152, "{case}");
-        assert_eq!(streams.stream_at(3584 + 1192), Some((5, 1192)), "{case}");
+        let offset = FT + TS + SP + FP + FT + 40;
+        assert_eq!(streams.stream_at(offset), Some((5, FT + 40)), "{case}");
 
         let case = "offset aligned to the end of the last stream";
-        assert_eq!(streams.get(6).unwrap().data().len(), 1136, "{case}");
-        assert_eq!(streams.stream_at(4880 + 1136), Some((6, 1136)), "{case}");
+        let offset = FT + TS + SP + FP + FT + TS + SP;
+        assert_eq!(streams.stream_at(offset), Some((6, SP)), "{case}");
 
         let case = "offset past the end of the last stream";
-        assert_eq!(streams.get(6).unwrap().data().len(), 1136, "{case}");
-        assert_eq!(streams.stream_at(4880 + 1280), None, "{case}");
+        let offset = FT + TS + SP + FP + FT + TS + SP + 2;
+        assert_eq!(streams.stream_at(offset), None, "{case}");
     }
 
     #[test]
     fn blockstreams_stream_at_end_aligned() {
         let case = "end of a partial stream";
         let streams = BlockStreams::try_from(blockstreams!(fp, fp, fe)).unwrap();
-        assert_eq!(streams.stream_at(1152 + 1152), Some((1, 1152)), "{case}");
+        assert_eq!(streams.stream_at(FP + FP), Some((1, FP)), "{case}");
 
         let case = "end of a full stream with empty";
         let streams = BlockStreams::try_from(blockstreams!(fp, ff, fe)).unwrap();
-        assert_eq!(streams.stream_at(1152 + 1280), Some((2, 0)), "{case}");
+        assert_eq!(streams.stream_at(FP + FF), Some((2, 0)), "{case}");
 
         let case = "end of a full stream without empty";
         let streams = BlockStreams::try_from(blockstreams!(fp, fp, ff)).unwrap();
-        assert_eq!(streams.stream_at(2304 + 1280), Some((3, 0)), "{case}");
+        assert_eq!(streams.stream_at(FP + FP + FF), Some((3, 0)), "{case}");
 
         let case = "start of a spilled stream";
         let streams = BlockStreams::try_from(blockstreams!(fp, ft, se)).unwrap();
-        assert_eq!(streams.stream_at(2304 + 144), Some((2, 0)), "{case}");
+        assert_eq!(streams.stream_at(FP + FT + TS), Some((2, 0)), "{case}");
     }
 
     #[test]
@@ -2793,33 +2808,28 @@ mod tests {
         assert_eq!(streams.stream_at(16), None, "{case}");
 
         let case = "offset at the start of the first stream";
-        assert_eq!(streams.stream_at(1296), Some((1, 0)), "{case}");
+        assert_eq!(streams.stream_at(FT + TS), Some((1, 0)), "{case}");
 
         let case = "offset within the first stream";
-        assert_eq!(streams.stream_at(1296 + 16), Some((1, 16)), "{case}");
+        assert_eq!(streams.stream_at(FT + TS + 16), Some((1, 16)), "{case}");
 
         let case = "offset aligned to the start of the second stream";
-        assert_eq!(streams.stream_at(1296 + 1136), Some((2, 0)), "{case}");
+        assert_eq!(streams.stream_at(FT + TS + SP), Some((2, 0)), "{case}");
 
         let case = "offset skipping empty streams";
-        assert_eq!(streams.stream_at(3584 + 16), Some((5, 16)), "{case}");
+        let offset = FT + TS + SP + FP + 16;
+        assert_eq!(streams.stream_at(offset), Some((5, 16)), "{case}");
 
         streams.remove();
         streams.remove();
         let case = "zero offset with empty streams at the start";
-        assert_eq!(streams.stream_at(3583), None, "{case}");
-        assert_eq!(streams.stream_at(3584), Some((5, 0)), "{case}");
+        let offset = FT + TS + SP + FP;
+        assert_eq!(streams.stream_at(offset - 1), None, "{case}");
+        assert_eq!(streams.stream_at(offset), Some((5, 0)), "{case}");
     }
 
     #[test]
     fn blockstreams_offset_at() {
-        // Lengths of different kinds of block streams, where TS is the buffer.
-        const FT: usize = 1152;
-        const FP: usize = 1152;
-        const SF: usize = 1280 - 16;
-        const SP: usize = 1152 - 16;
-        const TS: usize = 128 + 16;
-
         let mut streams =
             BlockStreams::try_from(blockstreams!(fp, ft, sp, fp, fe, ft, sf, fe)).unwrap();
         streams.remove();
