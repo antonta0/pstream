@@ -126,6 +126,9 @@ impl File {
                 "odd number of bufs",
             ));
         }
+        if bufs.len() > i32::MAX as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many bufs"));
+        }
         let mut uneven_bufs = bufs
             .chunks(2)
             .skip_while(|pair| pair[0].len() + pair[1].len() == block_size);
@@ -172,12 +175,10 @@ impl File {
             .write(true)
             .open(path)?;
         file.set_len(size)?;
-        // It's OK to cast - the limit was checked via verify_input.
-        #[allow(clippy::cast_possible_wrap)]
         #[cfg(all(feature = "libc", target_os = "linux"))]
         {
-            reserve(&file, size as i64)?;
-            double_readahead_pages(&file, size as i64)?;
+            reserve(&file, size)?;
+            double_readahead_pages(&file, size)?;
         }
         file.sync_all()?;
         Ok(File {
@@ -228,10 +229,8 @@ impl File {
                 "file size not aligned to block size",
             ));
         }
-        // It's OK to cast - the limit was checked above.
-        #[allow(clippy::cast_possible_wrap)]
         #[cfg(all(feature = "libc", target_os = "linux"))]
-        double_readahead_pages(&file, size as i64)?;
+        double_readahead_pages(&file, size)?;
 
         Ok(File {
             block_count: size >> block_shift,
@@ -284,6 +283,9 @@ impl Blocks for File {
     ///
     /// # Errors
     ///
+    /// If `bufs` length exceeds [`i32::MAX`], an error of
+    /// [`io::ErrorKind::InvalidInput`] kind is returned.
+    ///
     /// If the end of file is reached before the `bufs` has been filled, an
     /// error of [`io::ErrorKind::UnexpectedEof`] is returned. In other cases,
     /// returns the underlying IO error.
@@ -291,6 +293,9 @@ impl Blocks for File {
     /// Note, that sync errors persistently make the file unusable. See
     /// [type][File#handling-sync-errors] documentation for more details.
     fn load_from(&mut self, block: u64, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<()> {
+        if bufs.len() > i32::MAX as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many bufs"));
+        }
         self.read_exact_vectored_at(bufs, block << self.block_shift)
     }
 
@@ -307,8 +312,8 @@ impl Blocks for File {
     /// # Errors
     ///
     /// If `bufs` structure do not match what is guaranteed by `BlockStream`
-    /// implementation [`io::ErrorKind::InvalidInput`] is returned. See
-    /// [`Blocks::store_at`] for details.
+    /// implementation, an error of [`io::ErrorKind::InvalidInput`] is returned.
+    /// See [`Blocks::store_at`] for details.
     ///
     /// If the total length of `bufs` exceed the capcity of a file, an error
     /// of [`io::ErrorKind::OutOfMemory`] is returned. If the underlying file
@@ -352,12 +357,14 @@ impl File {
     ///
     /// This is a one-time operation and not an advise about the future.
     #[inline(always)]
-    fn free_cached_pages(&mut self, offset: i64, size: i64) -> io::Result<()> {
+    fn free_cached_pages(&mut self, offset: u64, size: u64) -> io::Result<()> {
         let ret = unsafe {
+            // The total size of a file is verified when created or opened.
+            #[allow(clippy::cast_possible_wrap)]
             libc::posix_fadvise(
                 self.inner()?.as_raw_fd(),
-                offset,
-                size,
+                offset as libc::off64_t,
+                size as libc::off64_t,
                 libc::POSIX_FADV_DONTNEED,
             )
         };
@@ -371,7 +378,7 @@ impl File {
     /// a no-op otherwise. This is used to reduce the rate of syscalls during
     /// writes.
     #[inline(always)]
-    fn maybe_free_cached_pages(&mut self, offset: i64, size: i64, shift: u32) -> io::Result<()> {
+    fn maybe_free_cached_pages(&mut self, offset: u64, size: u64, shift: u32) -> io::Result<()> {
         let start = offset >> shift;
         let end = (offset + size) >> shift;
         if start == end {
@@ -382,8 +389,17 @@ impl File {
 
     /// A wrapper around `sync_file_range` that allows setting generic flags.
     #[inline(always)]
-    fn sync_file_range(&mut self, offset: i64, size: i64, flags: u32) -> io::Result<()> {
-        let ret = unsafe { libc::sync_file_range(self.inner()?.as_raw_fd(), offset, size, flags) };
+    fn sync_file_range(&mut self, offset: u64, size: u64, flags: libc::c_uint) -> io::Result<()> {
+        let ret = unsafe {
+            // The total size of a file is verified when created or opened.
+            #[allow(clippy::cast_possible_wrap)]
+            libc::sync_file_range(
+                self.inner()?.as_raw_fd(),
+                offset as libc::off64_t,
+                size as libc::off64_t,
+                flags,
+            )
+        };
         match ret {
             0 => Ok(()),
             -1 => Err(io::Error::last_os_error()),
@@ -393,13 +409,13 @@ impl File {
 
     /// Starts an asynchronous sync of data range starting at `offset`.
     #[inline(always)]
-    fn sync_file_range_start(&mut self, offset: i64, size: i64) -> io::Result<()> {
+    fn sync_file_range_start(&mut self, offset: u64, size: u64) -> io::Result<()> {
         self.sync_file_range(offset, size, libc::SYNC_FILE_RANGE_WRITE)
     }
 
     /// Waits until the data range starting at `offset` has been synced.
     #[inline(always)]
-    fn sync_file_range_wait(&mut self, offset: i64, size: i64) -> io::Result<()> {
+    fn sync_file_range_wait(&mut self, offset: u64, size: u64) -> io::Result<()> {
         self.sync_file_range(
             offset,
             size,
@@ -413,16 +429,19 @@ impl File {
     fn read_vectored_at(
         &mut self,
         bufs: &mut [io::IoSliceMut<'_>],
-        offset: i64,
+        offset: u64,
     ) -> io::Result<usize> {
         let ret = unsafe {
+            // The total size of a file is verified when created or opened.
+            // The length of bufs is verified in `load_from`.
+            #[allow(clippy::cast_possible_wrap)]
             libc::preadv(
                 self.inner()?.as_raw_fd(),
                 bufs.as_mut_ptr().cast::<libc::iovec>(),
                 // The size of c_int is likely smaller than the constant anyway.
                 #[allow(clippy::cast_possible_truncation)]
                 cmp::min(bufs.len() as libc::c_int, libc::UIO_MAXIOV),
-                offset,
+                offset as libc::off64_t,
             )
         };
         if ret >= 0 {
@@ -436,15 +455,18 @@ impl File {
     }
 
     #[inline(always)]
-    fn write_vectored_at(&mut self, bufs: &[io::IoSlice<'_>], offset: i64) -> io::Result<usize> {
+    fn write_vectored_at(&mut self, bufs: &[io::IoSlice<'_>], offset: u64) -> io::Result<usize> {
         let ret = unsafe {
+            // The total size of a file is verified when created or opened.
+            // The length of bufs is verified in `store_at`.
+            #[allow(clippy::cast_possible_wrap)]
             libc::pwritev(
                 self.inner()?.as_raw_fd(),
                 bufs.as_ptr().cast::<libc::iovec>(),
                 // The size of c_int is likely smaller than the constant anyway.
                 #[allow(clippy::cast_possible_truncation)]
                 cmp::min(bufs.len() as libc::c_int, libc::UIO_MAXIOV),
-                offset,
+                offset as libc::off64_t,
             )
         };
         if ret >= 0 {
@@ -463,16 +485,19 @@ impl File {
     fn write_vectored_at_dsync(
         &mut self,
         bufs: &[io::IoSlice<'_>],
-        offset: i64,
+        offset: u64,
     ) -> io::Result<usize> {
         let ret = unsafe {
+            // The total size of a file is verified when created or opened.
+            // The length of bufs is verified in `store_at`.
+            #[allow(clippy::cast_possible_wrap)]
             libc::pwritev2(
                 self.inner()?.as_raw_fd(),
                 bufs.as_ptr().cast::<libc::iovec>(),
                 // The size of c_int is likely smaller than the constant anyway.
                 #[allow(clippy::cast_possible_truncation)]
                 cmp::min(bufs.len() as libc::c_int, libc::UIO_MAXIOV),
-                offset,
+                offset as libc::off64_t,
                 libc::RWF_DSYNC,
             )
         };
@@ -495,7 +520,7 @@ impl File {
         let mut current = offset;
         while !bufs.is_empty() {
             // FUTURE: Use unix_file_vectored_at feature once stable.
-            match self.read_vectored_at(bufs, current as i64) {
+            match self.read_vectored_at(bufs, current) {
                 Ok(0) => break,
                 Ok(read) => {
                     // FUTURE: Use io_slice_advance feature when stable.
@@ -507,7 +532,7 @@ impl File {
                             core::slice::from_raw_parts_mut(buf.as_ptr() as *mut u8, buf.len())
                         })
                     });
-                    self.free_cached_pages(current as i64, read as i64)?;
+                    self.free_cached_pages(current, read as u64)?;
                     current = current.saturating_add(read as u64);
                 }
                 Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -537,10 +562,9 @@ impl File {
         if total_len <= 1 << chunk_shift {
             let mut total_written = 0usize;
             while !bufs.is_empty() {
-                match self.write_vectored_at_dsync(
-                    bufs,
-                    offset.saturating_add(total_written as u64) as i64,
-                ) {
+                match self
+                    .write_vectored_at_dsync(bufs, offset.saturating_add(total_written as u64))
+                {
                     Ok(0) => {
                         return Err(io::Error::new(
                             io::ErrorKind::WriteZero,
@@ -556,7 +580,7 @@ impl File {
                     Err(err) => return Err(err),
                 }
             }
-            return self.maybe_free_cached_pages(offset as i64, total_written as i64, chunk_shift);
+            return self.maybe_free_cached_pages(offset, total_written as u64, chunk_shift);
         }
 
         // Slow path. Here we make use of asynchronous sync while writing the
@@ -567,9 +591,9 @@ impl File {
         let mut chunks = bufs.chunks_mut(bufs_per_chunk).peekable();
         let mut is_first = true;
         while let Some(mut chunk) = chunks.next() {
-            let current = offset as i64;
+            let current = offset;
             while !chunk.is_empty() {
-                match self.write_vectored_at(chunk, offset as i64) {
+                match self.write_vectored_at(chunk, offset) {
                     Ok(0) => {
                         return Err(io::Error::new(
                             io::ErrorKind::WriteZero,
@@ -586,7 +610,7 @@ impl File {
                 }
             }
 
-            let written = offset as i64 - current;
+            let written = offset - current;
             if let Err(err) = self.sync_file_range_start(current, written) {
                 self.inner.take();
                 return Err(err);
@@ -1413,9 +1437,11 @@ impl Drop for LockFile {
 /// Increases the number of the kernel read-ahead pages by 2.
 #[cfg(all(feature = "libc", target_os = "linux"))]
 #[inline(always)]
-fn double_readahead_pages<F: AsRawFd>(f: &F, size: i64) -> io::Result<()> {
+fn double_readahead_pages<F: AsRawFd>(f: &F, size: u64) -> io::Result<()> {
     let advise = libc::POSIX_FADV_SEQUENTIAL;
-    let ret = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, size, advise) };
+    // The total size of a file is verified when created or opened.
+    #[allow(clippy::cast_possible_wrap)]
+    let ret = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, size as libc::off64_t, advise) };
     if ret == 0 {
         return Ok(());
     }
@@ -1428,9 +1454,16 @@ fn double_readahead_pages<F: AsRawFd>(f: &F, size: i64) -> io::Result<()> {
 /// once on a newly created file. That's it.
 #[cfg(all(feature = "libc", target_os = "linux"))]
 #[inline(always)]
-fn reserve<F: AsRawFd>(f: &F, size: i64) -> io::Result<()> {
+fn reserve<F: AsRawFd>(f: &F, size: u64) -> io::Result<()> {
     let ret = unsafe {
-        libc::fallocate(f.as_raw_fd(), /*mode=*/ 0, /*offset=*/ 0, size)
+        // The total size of a file is verified when created or opened.
+        #[allow(clippy::cast_possible_wrap)]
+        libc::fallocate(
+            f.as_raw_fd(),
+            /*mode=*/ 0,
+            /*offset=*/ 0,
+            size as libc::off64_t,
+        )
     };
     match ret {
         0 => Ok(()),
