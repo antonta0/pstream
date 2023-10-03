@@ -611,27 +611,22 @@ impl File {
             }
 
             let written = offset - current;
-            if let Err(err) = self.sync_file_range_start(current, written) {
-                self.inner.take();
-                return Err(err);
-            }
             if !is_first {
                 // All preceding chunks are guaranteed to be the size of a chunk.
                 let chunk_size = 1 << chunk_shift;
                 let previous = current - chunk_size;
-                if let Err(err) = self.sync_file_range_wait(previous, chunk_size) {
+                let size = chunk_size + chunks.peek().map_or(written, |_| 0);
+                if let Err(err) = self.sync_file_range_wait(previous, size) {
                     self.inner.take();
                     return Err(err);
                 }
-                self.maybe_free_cached_pages(previous, chunk_size, chunk_shift)?;
+                self.maybe_free_cached_pages(previous, size, chunk_shift)?;
             }
-            // Sync the last chunk, as the loop is going to terminate.
-            if chunks.peek().is_none() {
-                if let Err(err) = self.sync_file_range_wait(current, written) {
+            if chunks.peek().is_some() {
+                if let Err(err) = self.sync_file_range_start(current, written) {
                     self.inner.take();
                     return Err(err);
                 }
-                self.maybe_free_cached_pages(current, written, chunk_shift)?;
             }
             is_first = false;
         }
