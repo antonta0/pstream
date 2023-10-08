@@ -677,6 +677,15 @@ impl<A: BlocksAllocator> Stream<A> {
     }
 }
 
+impl<'stream, A: BlocksAllocator> IntoIterator for &'stream Stream<A> {
+    type Item = Chunk<'stream, A::Blocks>;
+    type IntoIter = Iter<'stream, A::Blocks>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// Errors specific to the [`Stream`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum StreamError {
@@ -1313,6 +1322,24 @@ impl Stats {
     #[must_use]
     pub fn data_available(&self) -> usize {
         self.iter().map(|stats| stats.data_available).sum()
+    }
+}
+
+impl IntoIterator for Stats {
+    type Item = BlockStreamStats;
+    type IntoIter = std::vec::IntoIter<BlockStreamStats>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'stats> IntoIterator for &'stats Stats {
+    type Item = &'stats BlockStreamStats;
+    type IntoIter = core::slice::Iter<'stats, BlockStreamStats>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
