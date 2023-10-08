@@ -484,18 +484,35 @@ impl<A: BlocksAllocator> Stream<A> {
     ///
     /// If newly allocated stream happens to have data written.
     pub fn grow(&self) -> io::Result<()> {
-        let mut stream = block::Stream::new(self.allocator.alloc()?);
-        // No need to load - the new stream is assumed to be zero-initialized.
-        stream.initialize().map_err(StreamError::BlockStreamError)?;
-        assert!(stream.is_empty());
-        self.streams.update_default(move |current, streams| {
-            let _locked = Self::lock_buffers(current);
-            streams.clone_from(current);
-            streams
-                .append(Arc::new(stream))
-                .expect("appending an empty stream should always succeed");
-        });
-        Ok(())
+        let mut result = Ok(());
+        let stream = core::cell::RefCell::new(None);
+        self.streams.compare_update_default(
+            |_| {
+                let blocks = match self.allocator.alloc() {
+                    Ok(blocks) => blocks,
+                    Err(err) => {
+                        result = Err(err);
+                        return false;
+                    }
+                };
+                let mut stream = stream.borrow_mut();
+                let stream = stream.get_or_insert(block::Stream::new(blocks));
+                // No need to load - the new stream is assumed to be zero-initialized.
+                stream
+                    .initialize()
+                    .expect("empty stream should always initialize");
+                assert!(stream.is_empty());
+                true
+            },
+            |current, streams| {
+                let _locked = Self::lock_buffers(current);
+                streams.clone_from(current);
+                streams
+                    .append(Arc::new(stream.borrow_mut().take().unwrap()))
+                    .expect("appending an empty stream should always succeed");
+            },
+        );
+        result
     }
 
     /// Tries to shrink this stream, removing blocks which are no longer
