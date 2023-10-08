@@ -1069,6 +1069,13 @@ unsafe impl BlocksAllocator for FileSequence {
     /// made available via [`FileSequence::release`]. The maximum size of the
     /// sequence is 2<sup>14</sup> &minus; 1.
     ///
+    /// In the unlikely scenario when the thread allocating a file paused such
+    /// that the file it wanted to create has been already removed from the
+    /// sequence, or in other words the index is smaller than the starting index
+    /// of a sequence, an error of [`io::ErrorKind::Other`] kind is returned
+    /// with the value set to [`FileSequenceError::OutOfRange`]. This error is
+    /// retriable.
+    ///
     /// Concurrent attempts to create a file may or may not result in
     /// [`io::ErrorKind::AlreadyExists`]. In which case attempt could be
     /// retried, unless the file with the same index has been injected into the
@@ -1099,8 +1106,12 @@ unsafe impl BlocksAllocator for FileSequence {
         // always fail, as the file already exists and the counter has not
         // been incremented.
         let path = self.get_filename(end, self.block_shift);
-        let file = File::create(path, self.block_count, self.block_shift)?
+        let file = File::create(&path, self.block_count, self.block_shift)?
             .with_alloc_info(self.stamp, end);
+        if end < WrappingSeq(self.start.load(atomic::Ordering::Relaxed)) {
+            fs::remove_file(path)?;
+            return Err(FileSequenceError::OutOfRange(end.into()).into());
+        }
         self.root.sync()?;
 
         // This is just to be on a safe side, and to communicate the intent.

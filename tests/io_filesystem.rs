@@ -465,64 +465,78 @@ fn filesequence_threads() -> io::Result<()> {
     for t in 1..=4 {
         let fileseq_clone = Arc::clone(&fileseq);
         let barrier_clone = Arc::clone(&barrier);
-        threads.push(std::thread::spawn(move || {
-            barrier_clone.wait();
-            for i in 0..iterations {
-                'iter: loop {
-                    if i & 1 == t & 1 {
-                        match fileseq_clone.alloc() {
-                            Ok(_) => break 'iter,
-                            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                                continue 'iter
-                            }
-                            Err(err) => panic!("{err}"),
-                        }
-                    } else {
-                        let mut file: Option<File> = None;
-                        match fileseq_clone.retrieve(|f| {
-                            file.get_or_insert(f);
-                        }) {
-                            Ok(_) => {}
-                            Err(err) if err.kind() == io::ErrorKind::NotFound => continue 'iter,
-                            Err(err) if err.kind() == io::ErrorKind::Other => {
-                                let inner = err
-                                    .get_ref()
-                                    .unwrap()
-                                    .downcast_ref::<FileSequenceError>()
-                                    .unwrap();
-                                match inner {
-                                    FileSequenceError::Broken
-                                    | FileSequenceError::OutOfRange(_) => continue 'iter,
-                                    _ => panic!("{err}"),
+        let thread = std::thread::Builder::new()
+            .name(format!("filesequence#{t}"))
+            .spawn(move || {
+                barrier_clone.wait();
+                for i in 0..iterations {
+                    'iter: loop {
+                        if i & 1 == t & 1 {
+                            match fileseq_clone.alloc() {
+                                Ok(_) => break 'iter,
+                                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                                    continue 'iter
                                 }
-                            }
-                            Err(err) => panic!("{err}"),
-                        }
-                        if file.is_none() {
-                            continue 'iter;
-                        }
-                        match fileseq_clone.release(file.unwrap()) {
-                            Ok(_) => break 'iter,
-                            Err((_, err)) if err.kind() == io::ErrorKind::NotFound => {
-                                continue 'iter
-                            }
-                            Err((_, err)) if err.kind() == io::ErrorKind::Other => {
-                                let inner = err
-                                    .get_ref()
-                                    .unwrap()
-                                    .downcast_ref::<FileSequenceError>()
-                                    .unwrap();
-                                match inner {
-                                    FileSequenceError::OutOfRange(_) => continue 'iter,
-                                    _ => panic!("{err}"),
+                                Err(err) if err.kind() == io::ErrorKind::Other => {
+                                    let inner = err
+                                        .get_ref()
+                                        .unwrap()
+                                        .downcast_ref::<FileSequenceError>()
+                                        .unwrap();
+                                    match inner {
+                                        FileSequenceError::OutOfRange(_) => continue 'iter,
+                                        _ => panic!("{err}"),
+                                    }
                                 }
+                                Err(err) => panic!("{err}"),
                             }
-                            Err((_, err)) => panic!("{err}"),
+                        } else {
+                            let mut file: Option<File> = None;
+                            match fileseq_clone.retrieve(|f| {
+                                file.get_or_insert(f);
+                            }) {
+                                Ok(_) => {}
+                                Err(err) if err.kind() == io::ErrorKind::NotFound => continue 'iter,
+                                Err(err) if err.kind() == io::ErrorKind::Other => {
+                                    let inner = err
+                                        .get_ref()
+                                        .unwrap()
+                                        .downcast_ref::<FileSequenceError>()
+                                        .unwrap();
+                                    match inner {
+                                        FileSequenceError::Broken
+                                        | FileSequenceError::OutOfRange(_) => continue 'iter,
+                                        _ => panic!("{err}"),
+                                    }
+                                }
+                                Err(err) => panic!("{err}"),
+                            }
+                            if file.is_none() {
+                                continue 'iter;
+                            }
+                            match fileseq_clone.release(file.unwrap()) {
+                                Ok(_) => break 'iter,
+                                Err((_, err)) if err.kind() == io::ErrorKind::NotFound => {
+                                    continue 'iter
+                                }
+                                Err((_, err)) if err.kind() == io::ErrorKind::Other => {
+                                    let inner = err
+                                        .get_ref()
+                                        .unwrap()
+                                        .downcast_ref::<FileSequenceError>()
+                                        .unwrap();
+                                    match inner {
+                                        FileSequenceError::OutOfRange(_) => continue 'iter,
+                                        _ => panic!("{err}"),
+                                    }
+                                }
+                                Err((_, err)) => panic!("{err}"),
+                            }
                         }
                     }
                 }
-            }
-        }));
+            });
+        threads.push(thread.unwrap());
     }
     threads
         .into_iter()
