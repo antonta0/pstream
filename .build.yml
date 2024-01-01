@@ -1,0 +1,46 @@
+image: archlinux
+packages:
+  - rustup
+sources:
+  - git@git.sr.ht:~antonta/pstream
+secrets:
+  - 712fa3ad-a98c-4d5f-9b22-c4f8ca3be96a
+environment:
+  FEATURESET_all: io-filesystem,libc
+  FEATURESET_nolibc: io-filesystem
+  RUSTFLAGS: -D warnings
+tasks:
+  - setup: |
+      rustup toolchain install nightly stable
+      cd pstream/
+      rustup run stable cargo fetch
+      rustup update stable && rustup default stable && rustup component add clippy
+      rustup update nightly && rustup default nightly && rustup component add clippy
+  - stable_all: |
+      cd pstream/
+      rustup default stable
+      cargo build --verbose --features $FEATURESET_all --future-incompat-report
+      cargo test --verbose --features $FEATURESET_all --future-incompat-report
+      cargo clippy --verbose --features $FEATURESET_all
+      cargo doc --verbose --all-features
+  - stable_nolibc: |
+      cd pstream/
+      rustup default stable
+      cargo build --verbose --features $FEATURESET_nolibc --future-incompat-report
+      cargo test --verbose --features $FEATURESET_nolibc --future-incompat-report
+      cargo clippy --verbose --features $FEATURESET_nolibc
+      cargo doc --verbose --all-features
+  - nightly_all: |
+      cd pstream/
+      rustup default nightly
+      cargo build --verbose --features $FEATURESET_all --future-incompat-report
+      cargo test --verbose --features $FEATURESET_all --future-incompat-report
+      cargo clippy --verbose --features $FEATURESET_all
+      cargo doc --verbose --all-features
+  - nightly_nolibc: |
+      cd pstream/
+      rustup default nightly
+      cargo build --verbose --features $FEATURESET_nolibc --future-incompat-report
+      cargo test --verbose --features $FEATURESET_nolibc --future-incompat-report
+      cargo clippy --verbose --features $FEATURESET_nolibc
+      cargo doc --verbose --all-features
