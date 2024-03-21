@@ -1562,7 +1562,7 @@ impl Drop for Lock<'_> {
 /// block. Represented as a single u64.
 ///
 /// Blocks may have data spilled from the previous block and / or spill data
-/// to future block(s). Storing this state allows navigating the buffer
+/// to following block(s). Storing this state allows navigating the buffer
 /// more efficiently, as well as recovering after restarts or crashes.
 ///
 /// The state is encoded in the following way:
