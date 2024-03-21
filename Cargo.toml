@@ -3,6 +3,13 @@ name = "pstream"
 version = "0.1.0"
 edition = "2021"
 
+authors = ["antonta <work@antonta.net>"]
+description = "A persistent byte stream over block storage."
+license = "MIT"
+repository = "https://git.sr.ht/~antonta/pstream"
+keywords = ["file", "io", "data", "storage", "concurrency"]
+categories = ["filesystems", "database-implementations"]
+
 [dependencies]
 crc32fast = "~1.3"
 vlock = "~0.2"
