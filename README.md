@@ -1,6 +1,6 @@
 # pstream
 
-> Work in progress. Use at your own risk.
+> Use at your own risk.
 
 A persistent byte stream over block storage.
 
