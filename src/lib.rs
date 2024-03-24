@@ -56,6 +56,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::inline_always)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod block;
 pub mod endless;
